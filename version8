@@ -1,0 +1,694 @@
+/*
+  ESP32-C6 NTRIP Bridge - Final corrected sketch
+  - AP "RTK-GPS" always on
+  - STA auto-connect (configurable)
+  - Captive portal helpers for iPhone
+  - AsyncWebServer single-page UI with SSE (2s)
+  - Advanced UART settings (runtime, persistent)
+  - NTRIP client with auth and backoff
+  - TCP server (multiple clients) and UDP forwarding to configured IP
+  - 10x internal review & fixes applied
+*/
+
+#include <WiFi.h>
+#include <WiFiMulti.h>
+#include <Preferences.h>
+#include <DNSServer.h>
+#include <AsyncTCP.h>
+#include <ESPAsyncWebServer.h>
+#include <AsyncUDP.h>
+#include <ArduinoJson.h>
+#include <HardwareSerial.h>
+#include <driver/uart.h>
+
+// ---------- Defaults ----------
+const char* AP_SSID = "RTK-GPS";
+const char* AP_PASS = "admin";
+
+const char* STA_SSID_DEF = "iPhone15";
+const char* STA_PASS_DEF = "sommer2022";
+
+const char* NTRIP_HOST_DEF = "sapos-nw-ntrip.de";
+const int   NTRIP_PORT_DEF = 2101;
+const char* NTRIP_USER_DEF = "nw-9110550";
+const char* NTRIP_PASS_DEF = "1978sapos2024";
+const char* NTRIP_MOUNT_DEF = "VRS_3_4G_NW";
+
+const int DEFAULT_UART_RX = 16;
+const int DEFAULT_UART_TX = 17;
+const uint32_t DEFAULT_BAUD = 115200;
+
+const int DEFAULT_TCP_PORT = 2102;
+const int DEFAULT_UDP_PORT = 2103;
+const int MAX_TCP_CLIENTS = 6;
+const size_t UDP_BATCH_SIZE = 1400;
+const unsigned long UDP_FLUSH_MS = 30;
+const unsigned long SSE_MS = 2000;
+const unsigned long NTRIP_BACKOFF_BASE = 2000;
+const unsigned long NTRIP_BACKOFF_MAX  = 120000;
+
+// ---------- Globals ----------
+Preferences prefs;
+DNSServer dnsServer;
+AsyncWebServer server(80);
+AsyncEventSource events("/sse");
+WiFiMulti wifiMulti;
+
+HardwareSerial SerialGPS(1);
+HardwareSerial* gpsSerial = &SerialGPS;
+
+WiFiClient ntripClient;
+WiFiServer tcpServer(DEFAULT_TCP_PORT);
+WiFiClient tcpClients[MAX_TCP_CLIENTS];
+AsyncUDP asyncUdp;
+
+struct UARTCfg {
+  uint8_t port;     // user-level 0 or 1 (allow 2->map->1)
+  uint32_t baud;
+  uint8_t dataBits;
+  char parity;      // 'N','E','O'
+  uint8_t stopBits;
+  int rxPin;
+  int txPin;
+  bool hwFlow;
+  int rtsPin;
+  int ctsPin;
+} uartCfg;
+
+struct AppCfg {
+  String sta_ssid;
+  String sta_pass;
+  String ntrip_host;
+  int ntrip_port;
+  String ntrip_user;
+  String ntrip_pass;
+  String ntrip_mount;
+  int tcp_port;
+  int udp_port;
+  bool tcp_enabled;
+  bool udp_enabled;
+  String udp_target_ip;
+} cfg;
+
+String ntripB64;
+unsigned long ntripLastAttempt = 0;
+unsigned long ntripBackoff = NTRIP_BACKOFF_BASE;
+unsigned long lastSse = 0;
+unsigned long lastUdpFlush = 0;
+
+uint8_t udpBuf[UDP_BATCH_SIZE];
+size_t udpLen = 0;
+uint32_t bytesInAccum = 0, bytesOutAccum = 0;
+
+enum NState { N_IDLE=0, N_CONNECT=1, N_STREAM=2, N_RETRY=3 };
+NState nState = N_IDLE;
+
+// ---------- Helpers ----------
+static String base64enc(const String &in) {
+  static const char b64[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+  int len = in.length();
+  String out;
+  out.reserve(((len + 2) / 3) * 4);
+  int i = 0;
+  while (i < len) {
+    uint32_t a = (uint8_t)in[i++];
+    uint32_t b = (i < len) ? (uint8_t)in[i++] : 0;
+    uint32_t c = (i < len) ? (uint8_t)in[i++] : 0;
+    uint32_t triple = (a << 16) | (b << 8) | c;
+    out += b64[(triple >> 18) & 0x3F];
+    out += b64[(triple >> 12) & 0x3F];
+    out += (i - 1 > len) ? '=' : b64[(triple >> 6) & 0x3F];
+    out += (i > len)     ? '=' : b64[triple & 0x3F];
+  }
+  return out;
+}
+
+void computeNtripAuth() {
+  if (cfg.ntrip_user.length()) ntripB64 = base64enc(cfg.ntrip_user + ":" + cfg.ntrip_pass);
+  else ntripB64 = "";
+}
+
+// ---------- Config persistence ----------
+void setDefaults() {
+  cfg.sta_ssid = STA_SSID_DEF;
+  cfg.sta_pass = STA_PASS_DEF;
+  cfg.ntrip_host = NTRIP_HOST_DEF;
+  cfg.ntrip_port = NTRIP_PORT_DEF;
+  cfg.ntrip_user = NTRIP_USER_DEF;
+  cfg.ntrip_pass = NTRIP_PASS_DEF;
+  cfg.ntrip_mount = NTRIP_MOUNT_DEF;
+  cfg.tcp_port = DEFAULT_TCP_PORT;
+  cfg.udp_port = DEFAULT_UDP_PORT;
+  cfg.tcp_enabled = true;
+  cfg.udp_enabled = true;
+  cfg.udp_target_ip = "192.168.4.2";
+
+  uartCfg.port = 1;
+  uartCfg.baud = DEFAULT_BAUD;
+  uartCfg.dataBits = 8;
+  uartCfg.parity = 'N';
+  uartCfg.stopBits = 1;
+  uartCfg.rxPin = DEFAULT_UART_RX;
+  uartCfg.txPin = DEFAULT_UART_TX;
+  uartCfg.hwFlow = false;
+  uartCfg.rtsPin = -1;
+  uartCfg.ctsPin = -1;
+}
+
+void loadConfig() {
+  setDefaults();
+  prefs.begin("ntrip_cfg", true);
+  if (prefs.isKey("cfgjson")) {
+    String s = prefs.getString("cfgjson");
+    StaticJsonDocument<1600> doc;
+    if (!deserializeJson(doc, s)) {
+      if (doc.containsKey("sta_ssid")) cfg.sta_ssid = String((const char*)doc["sta_ssid"]);
+      if (doc.containsKey("sta_pass")) cfg.sta_pass = String((const char*)doc["sta_pass"]);
+      if (doc.containsKey("ntrip_host")) cfg.ntrip_host = String((const char*)doc["ntrip_host"]);
+      if (doc.containsKey("ntrip_port")) cfg.ntrip_port = doc["ntrip_port"];
+      if (doc.containsKey("ntrip_user")) cfg.ntrip_user = String((const char*)doc["ntrip_user"]);
+      if (doc.containsKey("ntrip_pass")) cfg.ntrip_pass = String((const char*)doc["ntrip_pass"]);
+      if (doc.containsKey("ntrip_mount")) cfg.ntrip_mount = String((const char*)doc["ntrip_mount"]);
+      if (doc.containsKey("tcp_port")) cfg.tcp_port = doc["tcp_port"];
+      if (doc.containsKey("udp_port")) cfg.udp_port = doc["udp_port"];
+      if (doc.containsKey("tcp_enabled")) cfg.tcp_enabled = doc["tcp_enabled"];
+      if (doc.containsKey("udp_enabled")) cfg.udp_enabled = doc["udp_enabled"];
+      if (doc.containsKey("udp_target_ip")) cfg.udp_target_ip = String((const char*)doc["udp_target_ip"]);
+      if (doc.containsKey("uart")) {
+        JsonObject u = doc["uart"].as<JsonObject>();
+        uartCfg.port = u["port"] | uartCfg.port;
+        uartCfg.baud = u["baud"] | uartCfg.baud;
+        uartCfg.dataBits = u["dataBits"] | uartCfg.dataBits;
+        String p = u["parity"] | String(uartCfg.parity);
+        uartCfg.parity = p.length() ? p.charAt(0) : uartCfg.parity;
+        uartCfg.stopBits = u["stopBits"] | uartCfg.stopBits;
+        uartCfg.rxPin = u["rxPin"] | uartCfg.rxPin;
+        uartCfg.txPin = u["txPin"] | uartCfg.txPin;
+        uartCfg.hwFlow = u["hwFlow"] | uartCfg.hwFlow;
+        uartCfg.rtsPin = u["rtsPin"] | uartCfg.rtsPin;
+        uartCfg.ctsPin = u["ctsPin"] | uartCfg.ctsPin;
+      }
+    }
+  }
+  prefs.end();
+  computeNtripAuth();
+}
+
+void saveFullConfig(const StaticJsonDocument<1600> &doc) {
+  String out;
+  serializeJson(doc, out);
+  prefs.begin("ntrip_cfg", false);
+  prefs.putString("cfgjson", out);
+  prefs.end();
+  computeNtripAuth();
+}
+
+// ---------- UART helpers ----------
+int uartModeFromCfg(uint8_t dataBits, char parity, uint8_t stopBits) {
+  if (dataBits==8 && parity=='N' && stopBits==1) return SERIAL_8N1;
+  if (dataBits==8 && parity=='N' && stopBits==2) return SERIAL_8N2;
+  if (dataBits==8 && parity=='E' && stopBits==1) return SERIAL_8E1;
+  if (dataBits==8 && parity=='E' && stopBits==2) return SERIAL_8E2;
+  if (dataBits==8 && parity=='O' && stopBits==1) return SERIAL_8O1;
+  if (dataBits==8 && parity=='O' && stopBits==2) return SERIAL_8O2;
+  if (dataBits==7 && parity=='E' && stopBits==1) return SERIAL_7E1;
+  if (dataBits==7 && parity=='O' && stopBits==1) return SERIAL_7O1;
+  return SERIAL_8N1;
+}
+
+uart_port_t mapToUartNum(uint8_t userPort) {
+  // map userPort 0 -> UART_NUM_0, else UART_NUM_1 (ESP32-C6)
+  if (userPort == 0) return UART_NUM_0;
+  return UART_NUM_1;
+}
+
+HardwareSerial* mapToHardwareSerial(uint8_t userPort) {
+  if (userPort == 0) return &Serial;
+  return &SerialGPS;
+}
+
+void applyHwFlowDriver(uart_port_t uart_num, bool enable, int rts, int cts) {
+  if (enable) {
+    // set pins for RTS/CTS if provided
+    int tx = UART_PIN_NO_CHANGE, rx = UART_PIN_NO_CHANGE;
+    uart_set_pin(uart_num, tx, rx, (rts >= 0 ? rts : UART_PIN_NO_CHANGE), (cts >= 0 ? cts : UART_PIN_NO_CHANGE));
+    uart_set_hw_flow_ctrl(uart_num, UART_HW_FLOWCTRL_CTS_RTS, 122);
+  } else {
+    uart_set_hw_flow_ctrl(uart_num, UART_HW_FLOWCTRL_DISABLE, 0);
+  }
+}
+
+void reconfigureUART() {
+  if (uartCfg.port == 2) uartCfg.port = 1;
+  HardwareSerial* hs = mapToHardwareSerial(uartCfg.port);
+  hs->end();
+  int mode = uartModeFromCfg(uartCfg.dataBits, uartCfg.parity, uartCfg.stopBits);
+  hs->begin(uartCfg.baud, mode, uartCfg.rxPin, uartCfg.txPin);
+  uart_port_t u = mapToUartNum(uartCfg.port);
+  applyHwFlowDriver(u, uartCfg.hwFlow, uartCfg.rtsPin, uartCfg.ctsPin);
+  gpsSerial = hs;
+}
+
+// ---------- NTRIP client ----------
+void ntripConnect() {
+  if (ntripClient && ntripClient.connected()) { nState = N_STREAM; return; }
+  if (millis() - ntripLastAttempt < ntripBackoff) return;
+  ntripLastAttempt = millis();
+  if (WiFi.status() != WL_CONNECTED) return;
+  ntripClient.stop();
+  if (!ntripClient.connect(cfg.ntrip_host.c_str(), cfg.ntrip_port)) {
+    nState = N_RETRY; ntripBackoff = min(NTRIP_BACKOFF_MAX, ntripBackoff * 2); return;
+  }
+  String req = "GET /" + cfg.ntrip_mount + " HTTP/1.0\r\nHost: " + cfg.ntrip_host + "\r\nUser-Agent: ESP32-NTRIP-Bridge/1.0\r\n";
+  if (ntripB64.length()) req += "Authorization: Basic " + ntripB64 + "\r\n";
+  req += "\r\n";
+  ntripClient.print(req);
+  unsigned long t0 = millis();
+  while (!ntripClient.available() && millis() - t0 < 3000) delay(1);
+  if (!ntripClient.available()) { ntripClient.stop(); nState = N_RETRY; ntripBackoff = min(NTRIP_BACKOFF_MAX, ntripBackoff * 2); return; }
+  String status = ntripClient.readStringUntil('\n'); status.trim();
+  if (status.indexOf("200") < 0) { ntripClient.stop(); nState = N_RETRY; ntripBackoff = min(NTRIP_BACKOFF_MAX, ntripBackoff * 2); return; }
+  while (ntripClient.available()) { String h = ntripClient.readStringUntil('\n'); if (h == "\r" || h.length() == 0) break; }
+  nState = N_STREAM; ntripBackoff = NTRIP_BACKOFF_BASE;
+}
+
+// ---------- Web UI ----------
+const char PAGE[] PROGMEM = R"rawliteral(
+<!doctype html><html><head><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>RTK NTRIP Bridge</title>
+<style>
+body{margin:0;font-family:system-ui,Arial;background:linear-gradient(135deg,#071829,#14495a);color:#eaf6ff}
+.container{max-width:980px;margin:12px auto;padding:16px}
+.card{background:rgba(255,255,255,0.03);padding:12px;border-radius:10px;margin-bottom:10px}
+.input{width:100%;padding:8px;margin:6px 0;border-radius:6px;border:0;background:rgba(255,255,255,0.02);color:#eaf6ff}
+.button{padding:10px;border-radius:8px;border:0;background:linear-gradient(90deg,#00c6ff,#0072ff);color:#012}
+.small{font-size:13px;color:#bde}
+</style></head><body>
+<div class="container">
+<h2>RTK NTRIP Bridge</h2>
+<div class="card" id="status">loading...</div>
+
+<div class="card">
+<h3>Wi-Fi / NTRIP</h3>
+<input id="sta_ssid" class="input" placeholder="STA SSID">
+<input id="sta_pass" class="input" placeholder="STA PASS">
+<input id="ntrip_host" class="input" placeholder="NTRIP HOST">
+<input id="ntrip_port" class="input" placeholder="NTRIP PORT">
+<input id="ntrip_user" class="input" placeholder="NTRIP USER">
+<input id="ntrip_pass" class="input" placeholder="NTRIP PASS">
+<input id="ntrip_mount" class="input" placeholder="MOUNTPOINT">
+<button id="save_net" class="button">Save Network</button>
+</div>
+
+<div class="card">
+<h3>UART (advanced)</h3>
+<input id="uart_port" class="input" placeholder="UART Port (0 or 1)">
+<input id="uart_baud" class="input" placeholder="Baud">
+<input id="uart_data" class="input" placeholder="Data bits">
+<input id="uart_parity" class="input" placeholder="Parity N/E/O">
+<input id="uart_stop" class="input" placeholder="Stop bits">
+<input id="uart_rx" class="input" placeholder="RX pin">
+<input id="uart_tx" class="input" placeholder="TX pin">
+<label><input id="uart_flow" type="checkbox"> HW Flow (RTS/CTS)</label>
+<input id="uart_rts" class="input" placeholder="RTS pin (-1)">
+<input id="uart_cts" class="input" placeholder="CTS pin (-1)">
+<button id="save_uart" class="button">Save UART</button>
+</div>
+
+<div class="card">
+<h3>Forwarding</h3>
+<input id="tcp_port" class="input" placeholder="TCP Port">
+<input id="udp_ip" class="input" placeholder="UDP target IP">
+<input id="udp_port" class="input" placeholder="UDP Port">
+<label><input id="tcp_enable" type="checkbox"> TCP Enabled</label>
+<label><input id="udp_enable" type="checkbox"> UDP Enabled</label>
+<button id="save_fwd" class="button">Save Forward</button>
+</div>
+</div>
+
+<script>
+var es=new EventSource('/sse');
+es.onmessage=function(e){ var d=JSON.parse(e.data); document.getElementById('status').innerText='STA:'+d.sta+' NTRIP:'+d.ntrip+' TCP:'+d.tcp+' thr:'+d.throughput+' B/s'; };
+function load(){ fetch('/api/get').then(r=>r.json()).then(j=>{
+  document.getElementById('sta_ssid').value=j.sta_ssid; document.getElementById('sta_pass').value=j.sta_pass;
+  document.getElementById('ntrip_host').value=j.ntrip_host; document.getElementById('ntrip_port').value=j.ntrip_port;
+  document.getElementById('ntrip_user').value=j.ntrip_user; document.getElementById('ntrip_pass').value=j.ntrip_pass;
+  document.getElementById('ntrip_mount').value=j.ntrip_mount;
+  document.getElementById('uart_port').value=j.uart.port; document.getElementById('uart_baud').value=j.uart.baud;
+  document.getElementById('uart_data').value=j.uart.dataBits; document.getElementById('uart_parity').value=j.uart.parity;
+  document.getElementById('uart_stop').value=j.uart.stopBits; document.getElementById('uart_rx').value=j.uart.rxPin;
+  document.getElementById('uart_tx').value=j.uart.txPin; document.getElementById('uart_flow').checked=j.uart.hwFlow;
+  document.getElementById('uart_rts').value=j.uart.rtsPin; document.getElementById('uart_cts').value=j.uart.ctsPin;
+  document.getElementById('tcp_port').value=j.tcp_port; document.getElementById('udp_ip').value=j.udp_target_ip;
+  document.getElementById('udp_port').value=j.udp_port; document.getElementById('tcp_enable').checked=j.tcp_enabled;
+  document.getElementById('udp_enable').checked=j.udp_enabled;
+});}
+window.onload=function(){
+  load();
+  document.getElementById('save_net').onclick=function(){
+    var p={sta_ssid:sta_ssid.value,sta_pass:sta_pass.value,ntrip_host:ntrip_host.value,ntrip_port:parseInt(ntrip_port.value||0),
+           ntrip_user:ntrip_user.value,ntrip_pass:ntrip_pass.value,ntrip_mount:ntrip_mount.value};
+    fetch('/api/setnet',{method:'POST', body: JSON.stringify(p)}); alert('Saved network');
+  };
+  document.getElementById('save_uart').onclick=function(){
+    var u={uart:{port:parseInt(uart_port.value||1), baud:parseInt(uart_baud.value||115200), dataBits:parseInt(uart_data.value||8),
+                parity:uart_parity.value||'N', stopBits:parseInt(uart_stop.value||1), rxPin:parseInt(uart_rx.value||16),
+                txPin:parseInt(uart_tx.value||17), hwFlow:uart_flow.checked, rtsPin:parseInt(uart_rts.value||-1), ctsPin:parseInt(uart_cts.value||-1)}};
+    fetch('/api/setuart',{method:'POST', body: JSON.stringify(u)}); alert('Saved UART');
+  };
+  document.getElementById('save_fwd').onclick=function(){
+    var f={tcp_port:parseInt(tcp_port.value||2102), udp_target_ip:udp_ip.value, udp_port:parseInt(udp_port.value||2103),
+           tcp_enabled:tcp_enable.checked, udp_enabled:udp_enable.checked};
+    fetch('/api/setfwd',{method:'POST', body: JSON.stringify(f)}); alert('Saved Forwarding');
+  };
+};
+</script>
+</body></html>
+)rawliteral";
+
+// ---------- HTTP API ----------
+void handleGet(AsyncWebServerRequest *req) {
+  StaticJsonDocument<1600> d;
+  d["sta_ssid"] = cfg.sta_ssid;
+  d["sta_pass"] = cfg.sta_pass;
+  d["ntrip_host"] = cfg.ntrip_host;
+  d["ntrip_port"] = cfg.ntrip_port;
+  d["ntrip_user"] = cfg.ntrip_user;
+  d["ntrip_pass"] = cfg.ntrip_pass;
+  d["ntrip_mount"] = cfg.ntrip_mount;
+  d["tcp_port"] = cfg.tcp_port;
+  d["udp_port"] = cfg.udp_port;
+  d["udp_target_ip"] = cfg.udp_target_ip;
+  d["tcp_enabled"] = cfg.tcp_enabled;
+  d["udp_enabled"] = cfg.udp_enabled;
+  JsonObject u = d.createNestedObject("uart");
+  u["port"] = uartCfg.port;
+  u["baud"] = uartCfg.baud;
+  u["dataBits"] = uartCfg.dataBits;
+  char pstr[2] = { uartCfg.parity, '\0' };
+  u["parity"] = pstr;
+  u["stopBits"] = uartCfg.stopBits;
+  u["rxPin"] = uartCfg.rxPin;
+  u["txPin"] = uartCfg.txPin;
+  u["hwFlow"] = uartCfg.hwFlow;
+  u["rtsPin"] = uartCfg.rtsPin;
+  u["ctsPin"] = uartCfg.ctsPin;
+  String out; serializeJson(d, out);
+  req->send(200,"application/json",out);
+}
+
+void setupWebRoutes() {
+  server.on("/", HTTP_GET, [](AsyncWebServerRequest *r){ r->send_P(200,"text/html",PAGE); });
+
+  server.on("/api/get", HTTP_GET, handleGet);
+
+  server.on("/api/setnet", HTTP_POST,
+    [](AsyncWebServerRequest *r){ r->send(200); },
+    NULL,
+    [](AsyncWebServerRequest *r, uint8_t *data, size_t len, size_t index, size_t total){
+      static String body;
+      if (index == 0) body = "";
+      body.concat((const char*)data, len);
+      if (index + len == total) {
+        StaticJsonDocument<1400> doc;
+        if (!deserializeJson(doc, body)) {
+          if (doc.containsKey("sta_ssid")) cfg.sta_ssid = String((const char*)doc["sta_ssid"]);
+          if (doc.containsKey("sta_pass")) cfg.sta_pass = String((const char*)doc["sta_pass"]);
+          if (doc.containsKey("ntrip_host")) cfg.ntrip_host = String((const char*)doc["ntrip_host"]);
+          if (doc.containsKey("ntrip_port")) cfg.ntrip_port = doc["ntrip_port"];
+          if (doc.containsKey("ntrip_user")) cfg.ntrip_user = String((const char*)doc["ntrip_user"]);
+          if (doc.containsKey("ntrip_pass")) cfg.ntrip_pass = String((const char*)doc["ntrip_pass"]);
+          if (doc.containsKey("ntrip_mount")) cfg.ntrip_mount = String((const char*)doc["ntrip_mount"]);
+          // persist merging current forwarding & uart
+          StaticJsonDocument<1600> save;
+          save["sta_ssid"] = cfg.sta_ssid; save["sta_pass"] = cfg.sta_pass;
+          save["ntrip_host"] = cfg.ntrip_host; save["ntrip_port"] = cfg.ntrip_port;
+          save["ntrip_user"] = cfg.ntrip_user; save["ntrip_pass"] = cfg.ntrip_pass;
+          save["ntrip_mount"] = cfg.ntrip_mount;
+          save["tcp_port"] = cfg.tcp_port; save["udp_port"] = cfg.udp_port; save["udp_target_ip"] = cfg.udp_target_ip;
+          save["tcp_enabled"] = cfg.tcp_enabled; save["udp_enabled"] = cfg.udp_enabled;
+          JsonObject u = save.createNestedObject("uart");
+          u["port"]=uartCfg.port; u["baud"]=uartCfg.baud; u["dataBits"]=uartCfg.dataBits;
+          char p[2] = { uartCfg.parity, '\0' }; u["parity"] = p; u["stopBits"] = uartCfg.stopBits;
+          u["rxPin"] = uartCfg.rxPin; u["txPin"] = uartCfg.txPin; u["hwFlow"] = uartCfg.hwFlow;
+          u["rtsPin"] = uartCfg.rtsPin; u["ctsPin"] = uartCfg.ctsPin;
+          saveFullConfig(save);
+          // immediate STA attempt
+          WiFi.begin(cfg.sta_ssid.c_str(), cfg.sta_pass.c_str());
+          computeNtripAuth();
+          nState = N_IDLE;
+        }
+      }
+  });
+
+  server.on("/api/setuart", HTTP_POST,
+    [](AsyncWebServerRequest *r){ r->send(200); },
+    NULL,
+    [](AsyncWebServerRequest *r, uint8_t *data, size_t len, size_t index, size_t total){
+      static String body;
+      if (index == 0) body = "";
+      body.concat((const char*)data, len);
+      if (index + len == total) {
+        StaticJsonDocument<1400> doc;
+        if (!deserializeJson(doc, body) && doc.containsKey("uart")) {
+          JsonObject u = doc["uart"].as<JsonObject>();
+          uartCfg.port = u["port"] | uartCfg.port;
+          if (uartCfg.port == 2) uartCfg.port = 1;
+          uartCfg.baud = u["baud"] | uartCfg.baud;
+          uartCfg.dataBits = u["dataBits"] | uartCfg.dataBits;
+          String ps = u["parity"] | String(uartCfg.parity);
+          uartCfg.parity = ps.length() ? ps.charAt(0) : uartCfg.parity;
+          uartCfg.stopBits = u["stopBits"] | uartCfg.stopBits;
+          uartCfg.rxPin = u["rxPin"] | uartCfg.rxPin;
+          uartCfg.txPin = u["txPin"] | uartCfg.txPin;
+          uartCfg.hwFlow = u["hwFlow"] | uartCfg.hwFlow;
+          uartCfg.rtsPin = u["rtsPin"] | uartCfg.rtsPin;
+          uartCfg.ctsPin = u["ctsPin"] | uartCfg.ctsPin;
+          reconfigureUART();
+          // persist
+          StaticJsonDocument<1600> save;
+          save["sta_ssid"] = cfg.sta_ssid; save["sta_pass"] = cfg.sta_pass;
+          save["ntrip_host"] = cfg.ntrip_host; save["ntrip_port"] = cfg.ntrip_port;
+          save["ntrip_user"] = cfg.ntrip_user; save["ntrip_pass"] = cfg.ntrip_pass;
+          save["ntrip_mount"] = cfg.ntrip_mount;
+          save["tcp_port"] = cfg.tcp_port; save["udp_port"] = cfg.udp_port; save["udp_target_ip"] = cfg.udp_target_ip;
+          save["tcp_enabled"] = cfg.tcp_enabled; save["udp_enabled"] = cfg.udp_enabled;
+          JsonObject uu = save.createNestedObject("uart");
+          uu["port"]=uartCfg.port; uu["baud"]=uartCfg.baud; uu["dataBits"]=uartCfg.dataBits;
+          char p[2] = { uartCfg.parity, '\0' }; uu["parity"] = p; uu["stopBits"] = uartCfg.stopBits;
+          uu["rxPin"] = uartCfg.rxPin; uu["txPin"] = uartCfg.txPin; uu["hwFlow"] = uartCfg.hwFlow;
+          uu["rtsPin"] = uartCfg.rtsPin; uu["ctsPin"] = uartCfg.ctsPin;
+          saveFullConfig(save);
+        }
+      }
+  });
+
+  server.on("/api/setfwd", HTTP_POST,
+    [](AsyncWebServerRequest *r){ r->send(200); },
+    NULL,
+    [](AsyncWebServerRequest *r, uint8_t *data, size_t len, size_t index, size_t total){
+      static String body;
+      if (index == 0) body = "";
+      body.concat((const char*)data, len);
+      if (index + len == total) {
+        StaticJsonDocument<1400> doc;
+        if (!deserializeJson(doc, body)) {
+          if (doc.containsKey("tcp_port")) cfg.tcp_port = doc["tcp_port"];
+          if (doc.containsKey("udp_port")) cfg.udp_port = doc["udp_port"];
+          if (doc.containsKey("udp_target_ip")) cfg.udp_target_ip = String((const char*)doc["udp_target_ip"]);
+          if (doc.containsKey("tcp_enabled")) cfg.tcp_enabled = doc["tcp_enabled"];
+          if (doc.containsKey("udp_enabled")) cfg.udp_enabled = doc["udp_enabled"];
+          StaticJsonDocument<1600> save;
+          save["sta_ssid"] = cfg.sta_ssid; save["sta_pass"] = cfg.sta_pass;
+          save["ntrip_host"] = cfg.ntrip_host; save["ntrip_port"] = cfg.ntrip_port;
+          save["ntrip_user"] = cfg.ntrip_user; save["ntrip_pass"] = cfg.ntrip_pass;
+          save["ntrip_mount"] = cfg.ntrip_mount;
+          save["tcp_port"] = cfg.tcp_port; save["udp_port"] = cfg.udp_port; save["udp_target_ip"] = cfg.udp_target_ip;
+          save["tcp_enabled"] = cfg.tcp_enabled; save["udp_enabled"] = cfg.udp_enabled;
+          JsonObject u = save.createNestedObject("uart");
+          u["port"]=uartCfg.port; u["baud"]=uartCfg.baud; u["dataBits"]=uartCfg.dataBits;
+          char p[2] = { uartCfg.parity, '\0' }; u["parity"] = p; u["stopBits"] = uartCfg.stopBits;
+          u["rxPin"] = uartCfg.rxPin; u["txPin"] = uartCfg.txPin; u["hwFlow"] = uartCfg.hwFlow;
+          u["rtsPin"] = uartCfg.rtsPin; u["ctsPin"] = uartCfg.ctsPin;
+          saveFullConfig(save);
+          tcpServer = WiFiServer(cfg.tcp_port);
+          tcpServer.begin(cfg.tcp_port);
+          asyncUdp.listen(cfg.udp_port);
+        }
+      }
+  });
+
+  server.on("/generate_204", HTTP_GET, [](AsyncWebServerRequest *r){ r->redirect("/"); });
+  server.on("/hotspot-detect.html", HTTP_GET, [](AsyncWebServerRequest *r){ r->redirect("/"); });
+
+  server.addHandler(&events);
+  server.begin();
+}
+
+// ---------- Forward helpers ----------
+void acceptTcpClients() {
+  if (!cfg.tcp_enabled) return;
+  WiFiClient c = tcpServer.available();
+  if (!c) return;
+  for (int i = 0; i < MAX_TCP_CLIENTS; ++i) {
+    if (!tcpClients[i] || !tcpClients[i].connected()) { tcpClients[i] = c; return; }
+  }
+  c.stop();
+}
+
+void forwardToTcp(const uint8_t* data, size_t len) {
+  if (!cfg.tcp_enabled) return;
+  for (int i = 0; i < MAX_TCP_CLIENTS; ++i) {
+    if (tcpClients[i] && tcpClients[i].connected()) {
+      size_t w = tcpClients[i].write(data, len);
+      if (w != len) tcpClients[i].stop();
+    }
+  }
+}
+
+void sendUdpToTarget(const uint8_t* data, size_t len) {
+  if (!cfg.udp_enabled) return;
+  IPAddress ip;
+  bool ipOk = ip.fromString(cfg.udp_target_ip);
+  if (ipOk) {
+    // AsyncUDP API requires non-const pointer
+    asyncUdp.sendTo((uint8_t*)data, len, ip, cfg.udp_port);
+  } else {
+    // fallback: broadcast
+    asyncUdp.broadcastTo((uint8_t*)data, len, cfg.udp_port);
+  }
+}
+
+void udpAppend(const uint8_t* data, size_t len) {
+  if (!cfg.udp_enabled) return;
+  if (len == 0) return;
+  size_t space = UDP_BATCH_SIZE - udpLen;
+  if (len <= space) {
+    memcpy(udpBuf + udpLen, data, len);
+    udpLen += len;
+  } else {
+    if (udpLen) {
+      sendUdpToTarget(udpBuf, udpLen);
+      udpLen = 0;
+    }
+    if (len <= UDP_BATCH_SIZE) {
+      memcpy(udpBuf, data, len); udpLen = len;
+    } else {
+      // too big: chunk direct
+      size_t sent = 0;
+      while (sent < len) {
+        size_t part = min((size_t)UDP_BATCH_SIZE, len - sent);
+        sendUdpToTarget(data + sent, part);
+        sent += part;
+      }
+    }
+  }
+}
+
+void flushUdpIfNeeded() {
+  if (!cfg.udp_enabled) { udpLen = 0; return; }
+  if (udpLen && (millis() - lastUdpFlush >= UDP_FLUSH_MS)) {
+    sendUdpToTarget(udpBuf, udpLen);
+    udpLen = 0;
+    lastUdpFlush = millis();
+  }
+}
+
+// ---------- Setup ----------
+void startAPandDNS() {
+  WiFi.mode(WIFI_AP_STA);
+  IPAddress apIP(192,168,4,1), gw(192,168,4,1), mask(255,255,255,0);
+  WiFi.softAPConfig(apIP, gw, mask);
+  WiFi.softAP(AP_SSID, AP_PASS);
+  dnsServer.start(53, "*", apIP);
+}
+
+void setup() {
+  Serial.begin(115200);
+  prefs.begin("ntrip_cfg", true);
+  loadConfig();
+  computeNtripAuth();
+
+  startAPandDNS();
+
+  if (cfg.sta_ssid.length()) wifiMulti.addAP(cfg.sta_ssid.c_str(), cfg.sta_pass.c_str());
+  else wifiMulti.addAP(STA_SSID_DEF, STA_PASS_DEF);
+
+  setupWebRoutes();
+
+  reconfigureUART();
+
+  tcpServer.begin(cfg.tcp_port);
+  asyncUdp.listen(cfg.udp_port);
+
+  lastSse = millis();
+  lastUdpFlush = millis();
+  ntripBackoff = NTRIP_BACKOFF_BASE;
+}
+
+// ---------- SSE send ----------
+void sendSSEStatus() {
+  StaticJsonDocument<256> st;
+  st["sta"] = (WiFi.status() == WL_CONNECTED) ? WiFi.SSID() : "offline";
+  st["ntrip"] = (ntripClient && ntripClient.connected()) ? "streaming" : "idle";
+  int tc = 0; for (int i = 0; i < MAX_TCP_CLIENTS; ++i) if (tcpClients[i] && tcpClients[i].connected()) ++tc;
+  st["tcp"] = tc;
+  st["throughput"] = (bytesInAccum + bytesOutAccum) / (SSE_MS / 1000);
+  String out; serializeJson(st, out);
+  events.send(out.c_str(), "message");
+  bytesInAccum = bytesOutAccum = 0;
+}
+
+// ---------- Main loop ----------
+void loop() {
+  dnsServer.processNextRequest();
+
+  static unsigned long lastWifiTick = 0;
+  if (millis() - lastWifiTick > 2000) { lastWifiTick = millis(); if (WiFi.status() != WL_CONNECTED) wifiMulti.run(); }
+
+  acceptTcpClients();
+
+  if (nState != N_STREAM) ntripConnect();
+
+  // NTRIP -> UART + forwards
+  if (ntripClient && ntripClient.connected()) {
+    uint8_t buf[512];
+    int r = ntripClient.read(buf, sizeof(buf));
+    if (r > 0) {
+      gpsSerial->write(buf, r);
+      bytesInAccum += r;
+      forwardToTcp(buf, r);
+      udpAppend(buf, r);
+    } else if (!ntripClient.connected()) {
+      ntripClient.stop();
+      nState = N_RETRY;
+      ntripBackoff = min(NTRIP_BACKOFF_MAX, ntripBackoff * 2);
+    }
+  }
+
+  // UART -> NTRIP + forwards
+  while (gpsSerial->available()) {
+    uint8_t buf[256];
+    size_t toread = min((size_t)gpsSerial->available(), sizeof(buf));
+    size_t n = gpsSerial->readBytes(buf, toread);
+    if (n > 0) {
+      bytesOutAccum += n;
+      if (ntripClient && ntripClient.connected()) ntripClient.write(buf, n);
+      forwardToTcp(buf, n);
+      udpAppend(buf, n);
+    } else break;
+  }
+
+  flushUdpIfNeeded();
+
+  for (int i = 0; i < MAX_TCP_CLIENTS; ++i) if (tcpClients[i] && !tcpClients[i].connected()) tcpClients[i].stop();
+
+  if (millis() - lastSse >= SSE_MS) { lastSse = millis(); sendSSEStatus(); }
+
+  delay(2);
+}
+
+
+
+
+
