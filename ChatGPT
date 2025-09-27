@@ -1,0 +1,604 @@
+/*
+  ESP32-C6 NTRIP Bridge - single-file Arduino sketch
+  Features:
+    - AP (captive portal) "RTK-GPS" and STA (auto connect + robust reconnect)
+    - NTRIP client with Basic auth and mountpoint
+    - Forward NTRIP RTCM -> UART and to TCP/UDP clients
+    - Web config page (mobile-first, gradient UI, live status updates every 2s)
+    - Persistent settings via Preferences
+    - Basic reconnection and FreeRTOS tasks for NTRIP and TCP server
+    - Single-file, no external non-standard libs required beyond core ESP32 Arduino libs:
+        WiFi.h, WebServer.h, DNSServer.h, Preferences.h
+    - Defaults match provided values (override on web UI)
+  Notes:
+    - Adjust GPS UART pins if your board differs.
+    - Compile for ESP32C6 core in Arduino IDE.
+*/
+
+#include <WiFi.h>
+#include <WebServer.h>
+#include <DNSServer.h>
+#include <Preferences.h>
+
+// ------- Configuration storage keys -------
+Preferences prefs;
+const char *PREF_NAMESPACE = "ntrip_cfg";
+
+// ------- Defaults -------
+String defAP_SSID = "RTK-GPS";
+String defAP_PASS = "admin";
+
+String defSTA_SSID = "iPhone15";
+String defSTA_PASS = "sommer2022";
+
+String defNTRIP_HOST = "sapos-nw-ntrip.de";
+uint16_t defNTRIP_PORT = 2101;
+String defNTRIP_USER = "nw-9110550";
+String defNTRIP_PASS = "1978sapos2024";
+String defNTRIP_MOUNT = "VRS_3_4G_NW";
+
+uint32_t defUART_BAUD = 115200;
+int defUART_RX_PIN = 16; // change if needed
+int defUART_TX_PIN = 17; // change if needed
+
+uint16_t defTCP_PORT = 2102;
+uint16_t defUDP_PORT = 2103;
+
+// ------- Runtime settings (loaded from prefs) -------
+String apSsid, apPass;
+String staSsid, staPass;
+String ntripHost, ntripUser, ntripPass, ntripMount;
+uint16_t ntripPort;
+uint32_t uartBaud;
+int uartRxPin, uartTxPin;
+uint16_t tcpPort, udpPort;
+
+// ------- Networking and servers -------
+WebServer webServer(80);
+DNSServer dnsServer;
+WiFiServer tcpServer;
+WiFiUDP udpOut;
+
+// ------- UART for F9P / GNSS device -------
+HardwareSerial gpsSerial(2); // Serial2
+
+// ------- State and metrics -------
+volatile bool ntripConnected = false;
+volatile bool ntripStreaming = false;
+volatile uint64_t ntripBytesTotal = 0;
+volatile uint64_t uartBytesTxTotal = 0;
+volatile uint64_t uartBytesRxTotal = 0;
+
+unsigned long lastMetricsReset = 0;
+volatile uint64_t lastNtripBytes = 0;
+volatile uint64_t lastUartTxBytes = 0;
+volatile uint64_t lastUartRxBytes = 0;
+
+#define MAX_TCP_CLIENTS 6
+WiFiClient tcpClients[MAX_TCP_CLIENTS];
+
+// simple lock for clients
+portMUX_TYPE clientMux = portMUX_INITIALIZER_UNLOCKED;
+
+// ------- Utility: Basic Base64 (for Authorization header) -------
+String base64encode(const String &in) {
+  static const char b[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+  String out;
+  int val=0, valb=-6;
+  for (uint8_t c : (const unsigned char*)in.c_str()) {
+    val = (val<<8) + c;
+    valb += 8;
+    while (valb>=0) {
+      out += b[(val>>valb)&0x3F];
+      valb -= 6;
+    }
+  }
+  if (valb>-6) out += b[((val<<8)>>(valb+8))&0x3F];
+  while (out.length()%4) out += '=';
+  return out;
+}
+
+// ------- Persistent storage -------
+void loadPreferences() {
+  prefs.begin(PREF_NAMESPACE, true);
+  apSsid = prefs.getString("apSsid", defAP_SSID);
+  apPass = prefs.getString("apPass", defAP_PASS);
+  staSsid = prefs.getString("staSsid", defSTA_SSID);
+  staPass = prefs.getString("staPass", defSTA_PASS);
+  ntripHost = prefs.getString("ntripHost", defNTRIP_HOST);
+  ntripPort = prefs.getUShort("ntripPort", defNTRIP_PORT);
+  ntripUser = prefs.getString("ntripUser", defNTRIP_USER);
+  ntripPass = prefs.getString("ntripPass", defNTRIP_PASS);
+  ntripMount = prefs.getString("ntripMount", defNTRIP_MOUNT);
+  uartBaud = prefs.getUInt("uartBaud", defUART_BAUD);
+  uartRxPin = prefs.getInt("uartRx", defUART_RX_PIN);
+  uartTxPin = prefs.getInt("uartTx", defUART_TX_PIN);
+  tcpPort = prefs.getUShort("tcpPort", defTCP_PORT);
+  udpPort = prefs.getUShort("udpPort", defUDP_PORT);
+  prefs.end();
+}
+
+void savePreferences() {
+  prefs.begin(PREF_NAMESPACE, false);
+  prefs.putString("apSsid", apSsid);
+  prefs.putString("apPass", apPass);
+  prefs.putString("staSsid", staSsid);
+  prefs.putString("staPass", staPass);
+  prefs.putString("ntripHost", ntripHost);
+  prefs.putUShort("ntripPort", ntripPort);
+  prefs.putString("ntripUser", ntripUser);
+  prefs.putString("ntripPass", ntripPass);
+  prefs.putString("ntripMount", ntripMount);
+  prefs.putUInt("uartBaud", uartBaud);
+  prefs.putInt("uartRx", uartRxPin);
+  prefs.putInt("uartTx", uartTxPin);
+  prefs.putUShort("tcpPort", tcpPort);
+  prefs.putUShort("udpPort", udpPort);
+  prefs.end();
+}
+
+// ------- WiFi helpers -------
+IPAddress apIP(192,168,4,1);
+const byte DNS_PORT = 53;
+
+void startAP() {
+  WiFi.softAPConfig(apIP, apIP, IPAddress(255,255,255,0));
+  WiFi.softAP(apSsid.c_str(), apPass.c_str());
+  dnsServer.start(DNS_PORT, "*", apIP);
+}
+
+unsigned long staReconnectBackoff = 1000;
+unsigned long lastStaAttempt = 0;
+
+void ensureSTAConnected() {
+  if (staSsid.length() == 0) return;
+  if (WiFi.status() == WL_CONNECTED) {
+    staReconnectBackoff = 1000; // reset backoff
+    return;
+  }
+  unsigned long now = millis();
+  if (now - lastStaAttempt < staReconnectBackoff) return;
+  lastStaAttempt = now;
+
+  WiFi.begin(staSsid.c_str(), staPass.c_str());
+  // exponential backoff up to 30s
+  staReconnectBackoff = min(30000UL, staReconnectBackoff * 2);
+}
+
+// ------- TCP clients housekeeping -------
+void addTcpClient(WiFiClient &c) {
+  portENTER_CRITICAL(&clientMux);
+  for (int i=0;i<MAX_TCP_CLIENTS;i++) {
+    if (!tcpClients[i] || !tcpClients[i].connected()) {
+      tcpClients[i] = c;
+      portEXIT_CRITICAL(&clientMux);
+      return;
+    }
+  }
+  portEXIT_CRITICAL(&clientMux);
+  // no slot free
+  c.stop();
+}
+int tcpClientCount() {
+  int cnt=0;
+  portENTER_CRITICAL(&clientMux);
+  for (int i=0;i<MAX_TCP_CLIENTS;i++) if (tcpClients[i] && tcpClients[i].connected()) cnt++;
+  portEXIT_CRITICAL(&clientMux);
+  return cnt;
+}
+void handleTcpClientsWrite(const uint8_t *buf, size_t len) {
+  portENTER_CRITICAL(&clientMux);
+  for (int i=0;i<MAX_TCP_CLIENTS;i++) {
+    if (tcpClients[i] && tcpClients[i].connected()) {
+      tcpClients[i].write(buf, len);
+    }
+  }
+  portEXIT_CRITICAL(&clientMux);
+}
+
+// ------- NTRIP client task -------
+TaskHandle_t ntripTaskHandle = NULL;
+
+void ntripTask(void *param) {
+  for (;;) {
+    // require STA up
+    if (WiFi.status() != WL_CONNECTED) {
+      ntripConnected = false;
+      vTaskDelay(1000 / portTICK_PERIOD_MS);
+      continue;
+    }
+
+    WiFiClient client;
+    String auth = ntripUser + ":" + ntripPass;
+    String authB64 = base64encode(auth);
+    String req;
+    // Use HTTP/1.0 for best compatibility with casters
+    req  = "GET /" + ntripMount + " HTTP/1.0\r\n";
+    req += "User-Agent: ESP32C6-NTRIP/1.0\r\n";
+    req += "Accept: */*\r\n";
+    req += "Connection: close\r\n";
+    req += "Authorization: Basic " + authB64 + "\r\n";
+    req += "\r\n";
+
+    if (!client.connect(ntripHost.c_str(), ntripPort)) {
+      ntripConnected = false;
+      vTaskDelay(2000 / portTICK_PERIOD_MS);
+      continue;
+    }
+
+    client.print(req);
+    ntripConnected = true;
+    ntripStreaming = true;
+    uint8_t buffer[1024];
+    unsigned long lastRead = millis();
+    while (client.connected() && WiFi.status()==WL_CONNECTED) {
+      if (client.available()) {
+        int r = client.readBytes((char*)buffer, sizeof(buffer));
+        if (r>0) {
+          ntripBytesTotal += r;
+          // forward to UART
+          gpsSerial.write(buffer, r);
+          uartBytesTxTotal += r;
+          // forward to tcp clients
+          handleTcpClientsWrite(buffer, r);
+          // optionally forward via UDP broadcast:
+          udpOut.beginPacketMulticast(IPAddress(239,255,0,1), udpPort, WiFi.localIP());
+          udpOut.write(buffer, r);
+          udpOut.endPacket();
+          lastRead = millis();
+        }
+      } else {
+        // check for idle - break after some time if needed
+        vTaskDelay(2 / portTICK_PERIOD_MS);
+      }
+    }
+    client.stop();
+    ntripConnected = false;
+    ntripStreaming = false;
+    // short pause before reconnect attempt
+    vTaskDelay(1000 / portTICK_PERIOD_MS);
+  }
+}
+
+// ------- TCP server task -------
+TaskHandle_t tcpTaskHandle = NULL;
+void tcpServerTask(void *param) {
+  tcpServer.begin(tcpPort);
+  for (;;) {
+    // accept new
+    WiFiClient c = tcpServer.available();
+    if (c) {
+      addTcpClient(c);
+    }
+    // remove dead clients
+    portENTER_CRITICAL(&clientMux);
+    for (int i=0;i<MAX_TCP_CLIENTS;i++) {
+      if (tcpClients[i] && !tcpClients[i].connected()) {
+        tcpClients[i].stop();
+      }
+    }
+    // read from TCP clients and forward to UART (bidirectional)
+    for (int i=0;i<MAX_TCP_CLIENTS;i++) {
+      if (tcpClients[i] && tcpClients[i].connected()) {
+        if (tcpClients[i].available()) {
+          uint8_t buf[256];
+          int r = tcpClients[i].read(buf, sizeof(buf));
+          if (r>0) {
+            uartBytesRxTotal += r;
+            gpsSerial.write(buf, r);
+          }
+        }
+      }
+    }
+    portEXIT_CRITICAL(&clientMux);
+    vTaskDelay(10 / portTICK_PERIOD_MS);
+  }
+}
+
+// ------- Web endpoints and captive portal -------
+void handleRoot() {
+  // Serve single-page config + status UI
+  String page = R"rawliteral(
+  <!doctype html>
+  <html>
+  <head>
+    <meta name="viewport" content="width=device-width,initial-scale=1">
+    <title>RTK NTRIP Bridge</title>
+    <style>
+      :root{--bg1:#0f172a;--bg2:#0b3d91;--card:#0b1220;--accent:#0ea5ff}
+      body{margin:0;font-family:system-ui,-apple-system,Segoe UI,Roboto,"Helvetica Neue",Arial;color:#e6eef8;
+        background:linear-gradient(135deg,var(--bg1),var(--bg2));min-height:100vh;display:flex;align-items:center;justify-content:center}
+      .container{max-width:760px;width:94%;padding:18px;border-radius:12px;background:linear-gradient(180deg,rgba(255,255,255,0.02),rgba(0,0,0,0.12));box-shadow:0 8px 30px rgba(2,6,23,0.6)}
+      h1{margin:0 0 8px;font-size:20px}
+      .grid{display:grid;grid-template-columns:1fr;gap:12px}
+      label{font-size:12px;opacity:0.85}
+      input,select{width:100%;padding:10px;border-radius:8px;border:0;background:#071126;color:#dff;box-sizing:border-box}
+      button{padding:10px 14px;border-radius:10px;border:0;background:var(--accent);color:#032544;font-weight:600}
+      .row{display:flex;gap:8px}
+      .status{display:flex;gap:10px;flex-wrap:wrap}
+      .pill{padding:8px 10px;border-radius:999px;background:rgba(255,255,255,0.04);font-size:13px}
+      pre{background:rgba(0,0,0,0.2);padding:8px;border-radius:6px;overflow:auto}
+      footer{font-size:11px;opacity:0.7;margin-top:8px}
+      @media(min-width:700px){.grid{grid-template-columns:1fr 1fr}}
+    </style>
+  </head>
+  <body>
+    <div class="container">
+      <h1>RTK NTRIP Bridge - Configuration</h1>
+      <div class="grid">
+        <div>
+          <label>WiFi STA SSID</label><input id="staSsid" />
+          <label>WiFi STA Password</label><input id="staPass" />
+          <label>AP SSID</label><input id="apSsid" />
+          <label>AP Password</label><input id="apPass" />
+          <label>NTRIP Host</label><input id="ntripHost" />
+          <label>NTRIP Port</label><input id="ntripPort" />
+          <label>NTRIP User</label><input id="ntripUser" />
+          <label>NTRIP Password</label><input id="ntripPass" />
+          <label>Mountpoint</label><input id="ntripMount" />
+        </div>
+        <div>
+          <label>UART Baud</label><input id="uartBaud" />
+          <label>UART RX Pin</label><input id="uartRx" />
+          <label>UART TX Pin</label><input id="uartTx" />
+          <label>TCP Port</label><input id="tcpPort" />
+          <label>UDP Port</label><input id="udpPort" />
+          <div style="margin-top:8px" class="row">
+            <button onclick="saveCfg()">Save</button>
+            <button onclick="restart()">Restart</button>
+          </div>
+          <h3 style="margin-top:12px">Status</h3>
+          <div class="status">
+            <div class="pill" id="staStat">STA: -</div>
+            <div class="pill" id="apStat">AP: -</div>
+            <div class="pill" id="ntripStat">NTRIP: -</div>
+            <div class="pill" id="clients">Clients: -</div>
+            <div class="pill" id="rates">Rates: -</div>
+          </div>
+          <h3>Throughput</h3>
+          <pre id="metrics">loading...</pre>
+        </div>
+      </div>
+      <footer>Auto-updates every 2s. Captive portal active when connected to AP.</footer>
+    </div>
+
+  <script>
+    async function loadCfg(){
+      let r = await fetch('/config');
+      let j = await r.json();
+      for(let k in j) {
+        let el = document.getElementById(k);
+        if(el) el.value = j[k];
+      }
+    }
+    async function saveCfg(){
+      let payload = {
+        apSsid:document.getElementById('apSsid').value,
+        apPass:document.getElementById('apPass').value,
+        staSsid:document.getElementById('staSsid').value,
+        staPass:document.getElementById('staPass').value,
+        ntripHost:document.getElementById('ntripHost').value,
+        ntripPort:parseInt(document.getElementById('ntripPort').value)||2101,
+        ntripUser:document.getElementById('ntripUser').value,
+        ntripPass:document.getElementById('ntripPass').value,
+        ntripMount:document.getElementById('ntripMount').value,
+        uartBaud:parseInt(document.getElementById('uartBaud').value)||115200,
+        uartRx:parseInt(document.getElementById('uartRx').value)||16,
+        uartTx:parseInt(document.getElementById('uartTx').value)||17,
+        tcpPort:parseInt(document.getElementById('tcpPort').value)||2102,
+        udpPort:parseInt(document.getElementById('udpPort').value)||2103
+      };
+      await fetch('/save', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify(payload)});
+      alert('Saved. Bridge will use new settings after restart.');
+    }
+    function restart(){ fetch('/restart',{method:'POST'}); }
+    async function statusPoll(){
+      let r = await fetch('/status');
+      let j = await r.json();
+      document.getElementById('staStat').innerText = 'STA: ' + (j.staConnected ? (j.staIP||'connected') : 'disconnected');
+      document.getElementById('apStat').innerText = 'AP: ' + j.apClients + ' clients';
+      document.getElementById('ntripStat').innerText = 'NTRIP: ' + (j.ntripConnected ? 'streaming' : 'idle');
+      document.getElementById('clients').innerText = 'TCP: ' + j.tcpClients;
+      document.getElementById('rates').innerText = 'NTRIP/s: ' + j.ntripRate + 'B | UART tx/s: ' + j.uartTxRate + 'B';
+      document.getElementById('metrics').innerText = JSON.stringify(j, null, 2);
+    }
+    setInterval(statusPoll, 2000);
+    loadCfg();
+    statusPoll();
+    // captive portal hint: when in AP mode the OS may show login automatically.
+  </script>
+  </body>
+  </html>
+  )rawliteral";
+
+  webServer.send(200, "text/html", page);
+}
+
+void handleGetConfig() {
+  String json = "{";
+  auto addKV = [&](const String &k, const String &v){ json += "\"" + k + "\":\"" + v + "\","; };
+  addKV("apSsid", apSsid);
+  addKV("apPass", apPass);
+  addKV("staSsid", staSsid);
+  addKV("staPass", staPass);
+  addKV("ntripHost", ntripHost);
+  addKV("ntripPort", String(ntripPort));
+  addKV("ntripUser", ntripUser);
+  addKV("ntripPass", ntripPass);
+  addKV("ntripMount", ntripMount);
+  addKV("uartBaud", String(uartBaud));
+  addKV("uartRx", String(uartRxPin));
+  addKV("uartTx", String(uartTxPin));
+  addKV("tcpPort", String(tcpPort));
+  addKV("udpPort", String(udpPort));
+  if (json.endsWith(",")) json.remove(json.length()-1);
+  json += "}";
+  webServer.send(200, "application/json", json);
+}
+
+void handleSaveConfig() {
+  if (webServer.method() != HTTP_POST) { webServer.send(405, "text/plain", "Method"); return; }
+  String body = webServer.arg("plain");
+  // naive JSON parse for required keys (sufficient for our UI)
+  auto getStr = [&](const char* key, const String &def) -> String {
+    int idx = body.indexOf(String("\"")+String(key)+String("\":"));
+    if (idx<0) return def;
+    int q = body.indexOf('"', idx + strlen(key) + 3);
+    if (q<0) return def;
+    int q2 = body.indexOf('"', q+1);
+    if (q2<0) return def;
+    return body.substring(q+1, q2);
+  };
+  auto getNum = [&](const char* key, long def) -> long {
+    int idx = body.indexOf(String("\"")+String(key)+String("\":"));
+    if (idx<0) return def;
+    int colon = body.indexOf(':', idx);
+    if (colon<0) return def;
+    int end = body.indexOf(',', colon);
+    if (end<0) end = body.indexOf('}', colon);
+    if (end<0) end = body.length();
+    String v = body.substring(colon+1, end);
+    v.trim();
+    return v.toInt();
+  };
+
+  apSsid = getStr("apSsid", apSsid); apPass = getStr("apPass", apPass);
+  staSsid = getStr("staSsid", staSsid); staPass = getStr("staPass", staPass);
+  ntripHost = getStr("ntripHost", ntripHost); ntripPort = (uint16_t)getNum("ntripPort", ntripPort);
+  ntripUser = getStr("ntripUser", ntripUser); ntripPass = getStr("ntripPass", ntripPass);
+  ntripMount = getStr("ntripMount", ntripMount);
+  uartBaud = (uint32_t)getNum("uartBaud", uartBaud);
+  uartRxPin = (int)getNum("uartRx", uartRxPin);
+  uartTxPin = (int)getNum("uartTx", uartTxPin);
+  tcpPort = (uint16_t)getNum("tcpPort", tcpPort);
+  udpPort = (uint16_t)getNum("udpPort", udpPort);
+
+  savePreferences();
+  webServer.send(200, "application/json", "{\"ok\":true}");
+}
+
+void handleStatus() {
+  // compute interval metrics
+  unsigned long now = millis();
+  uint64_t nb = ntripBytesTotal;
+  uint64_t ubt = uartBytesTxTotal;
+  uint64_t ubr = uartBytesRxTotal;
+  uint64_t nRate = 0, uartTxRate = 0, uartRxRate = 0;
+  unsigned long elapsed = (now - lastMetricsReset);
+  if (elapsed == 0) elapsed = 2000;
+  nRate = (nb - lastNtripBytes) * 1000 / elapsed;
+  uartTxRate = (ubt - lastUartTxBytes) * 1000 / elapsed;
+  uartRxRate = (ubr - lastUartRxBytes) * 1000 / elapsed;
+
+  lastNtripBytes = nb;
+  lastUartTxBytes = ubt;
+  lastUartRxBytes = ubr;
+  lastMetricsReset = now;
+
+  // build JSON
+  String json = "{";
+  json += "\"staConnected\":" + String(WiFi.status() == WL_CONNECTED ? "true" : "false") + ",";
+  json += "\"staIP\":\"" + WiFi.localIP().toString() + "\",";
+  json += "\"apClients\":" + String(WiFi.softAPgetStationNum()) + ",";
+  json += "\"ntripConnected\":" + String(ntripConnected ? "true":"false") + ",";
+  json += "\"ntripRate\":" + String(nRate) + ",";
+  json += "\"uartTxRate\":" + String(uartTxRate) + ",";
+  json += "\"uartRxRate\":" + String(uartRxRate) + ",";
+  json += "\"tcpClients\":" + String(tcpClientCount()) + ",";
+  json += "\"ntripTotal\":" + String(ntripBytesTotal) + ",";
+  json += "\"uartTxTotal\":" + String(uartBytesTxTotal) + ",";
+  json += "\"uartRxTotal\":" + String(uartBytesRxTotal);
+  json += "}";
+  webServer.send(200, "application/json", json);
+}
+
+void handleRestart() {
+  webServer.send(200, "text/plain", "restarting");
+  delay(200);
+  ESP.restart();
+}
+
+// redirect all to root for captive portal
+void handleNotFound() {
+  webServer.sendHeader("Location", String("http://") + apIP.toString() + "/", true);
+  webServer.send(302, "text/plain", "");
+}
+
+// ------- Setup -------
+void startServices() {
+  // web routes
+  webServer.on("/", HTTP_GET, handleRoot);
+  webServer.on("/config", HTTP_GET, handleGetConfig);
+  webServer.on("/save", HTTP_POST, handleSaveConfig);
+  webServer.on("/status", HTTP_GET, handleStatus);
+  webServer.on("/restart", HTTP_POST, handleRestart);
+  webServer.onNotFound(handleNotFound);
+  webServer.begin();
+  // start TCP task
+  xTaskCreatePinnedToCore(tcpServerTask, "tcpTask", 8*1024, NULL, 1, &tcpTaskHandle, 1);
+  // start NTRIP task
+  xTaskCreatePinnedToCore(ntripTask, "ntripTask", 16*1024, NULL, 1, &ntripTaskHandle, 1);
+}
+
+void setup() {
+  // Serial for debug
+  Serial.begin(115200);
+  delay(20);
+  // load persisted settings
+  loadPreferences();
+
+  // configure UART
+  gpsSerial.begin(uartBaud, SERIAL_8N1, uartRxPin, uartTxPin);
+  // start AP so config is always available
+  startAP();
+
+  // start DNS and web server
+  startServices();
+
+  // attempt STA connect (non-blocking)
+  WiFi.mode(WIFI_AP_STA);
+  WiFi.setAutoReconnect(true);
+  WiFi.persistent(true);
+  WiFi.begin(staSsid.c_str(), staPass.c_str());
+  tcpServer = WiFiServer(tcpPort);
+  udpOut.begin(udpPort);
+  lastMetricsReset = millis();
+}
+
+// ------- Loop -------
+void loop() {
+  // DNS redirection for captive portal only when in AP
+  dnsServer.processNextRequest();
+
+  // keep webserver responsive
+  webServer.handleClient();
+
+  // ensure STA is up
+  ensureSTAConnected();
+
+  // Accept TCP clients in main loop too
+  WiFiClient newClient = tcpServer.available();
+  if (newClient) addTcpClient(newClient);
+
+  // read UART (incoming from F9P) and forward to connected TCP clients
+  if (gpsSerial.available()) {
+    uint8_t buf[256];
+    int r = gpsSerial.readBytes((char*)buf, min((size_t)gpsSerial.available(), sizeof(buf)));
+    if (r > 0) {
+      uartBytesRxTotal += r;
+      handleTcpClientsWrite(buf, r); // forward to TCP clients
+      // optionally forward to NTRIP server (not typical). So only forward to clients.
+    }
+  }
+
+  // lightweight cleanup of dead TCP clients
+  portENTER_CRITICAL(&clientMux);
+  for (int i=0;i<MAX_TCP_CLIENTS;i++) {
+    if (tcpClients[i] && !tcpClients[i].connected()) {
+      tcpClients[i].stop();
+    }
+  }
+  portEXIT_CRITICAL(&clientMux);
+
+  delay(10);
+}
