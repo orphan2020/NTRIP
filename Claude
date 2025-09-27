@@ -1,0 +1,1005 @@
+
+/*
+* ESP32-C6 NTRIP Bridge - Production Ready Firmware
+* Advanced RTK GPS Correction Data Bridge with Dual WiFi Mode
+* 
+* Features:
+* - Simultaneous AP + STA WiFi modes with robust reconnection
+* - NTRIP client with automatic reconnection
+* - TCP/UDP server for data forwarding
+* - Web configuration interface with captive portal
+* - Real-time status monitoring
+* - Advanced UART configuration
+* - Mobile-optimized responsive design
+* 
+* Author: *****
+* Version: 1.0.0
+* Target: ESP32-C6
+*/
+
+#include <WiFi.h>
+#include <WebServer.h>
+#include <DNSServer.h>
+#include <WiFiClient.h>
+#include <EEPROM.h>
+#include <ArduinoJson.h>
+#include <base64.h>
+#include <HardwareSerial.h>
+
+// Pin definitions for ESP32-C6
+#define LED_BUILTIN 8
+#define UART_RX 20
+#define UART_TX 21
+
+// Network Configuration
+struct NetworkConfig {
+char ap_ssid[32] = "RTK-GPS";
+char ap_password[32] = "admin";
+char sta_ssid[32] = "iPhone15";
+char sta_password[32] = "sommer2022";
+bool ap_enabled = true;
+bool sta_enabled = true;
+};
+
+// NTRIP Configuration
+struct NTRIPConfig {
+char server[64] = "sapos-nw-ntrip.de";
+int port = 2101;
+char username[32] = "nw-9110550";
+char password[32] = "1978sapos2024";
+char mountpoint[32] = "VRS_3_4G_NW";
+bool enabled = true;
+int reconnect_interval = 5000;
+};
+
+// UART Configuration
+struct UARTConfig {
+long baud_rate = 115200;
+int data_bits = 8;
+int parity = 0; // 0=None, 1=Odd, 2=Even
+int stop_bits = 1;
+bool flow_control = false;
+};
+
+// TCP/UDP Configuration
+struct ServerConfig {
+int tcp_port = 2947;
+int udp_port = 2948;
+bool tcp_enabled = true;
+bool udp_enabled = true;
+char target_ip[16] = "192.168.4.2";
+int target_port = 2947;
+};
+
+// Global configuration
+NetworkConfig networkConfig;
+NTRIPConfig ntripConfig;
+UARTConfig uartConfig;
+ServerConfig serverConfig;
+
+// Network objects
+WebServer webServer(80);
+DNSServer dnsServer;
+WiFiClient ntripClient;
+WiFiServer tcpServer(2947);
+WiFiUDP udpServer;
+
+// Status variables
+struct SystemStatus {
+bool ap_active = false;
+bool sta_connected = false;
+bool internet_available = false;
+bool ntrip_connected = false;
+int connected_clients = 0;
+unsigned long ntrip_bytes_received = 0;
+unsigned long uart_bytes_sent = 0;
+unsigned long last_ntrip_data = 0;
+unsigned long last_uart_data = 0;
+float data_rate_ntrip = 0.0;
+float data_rate_uart = 0.0;
+};
+
+SystemStatus systemStatus;
+
+// Timing variables
+unsigned long lastNTRIPReconnect = 0;
+unsigned long lastWiFiReconnect = 0;
+unsigned long lastStatusUpdate = 0;
+unsigned long lastDataRateUpdate = 0;
+unsigned long ntripBytesLastSecond = 0;
+unsigned long uartBytesLastSecond = 0;
+
+// Buffer for NTRIP data
+uint8_t ntripBuffer[2048];
+uint8_t uartBuffer[1024];
+
+// Client management
+WiFiClient tcpClients[5];
+int clientCount = 0;
+
+void setup() {
+Serial.begin(115200);
+Serial.println("ESP32-C6 NTRIP Bridge Starting...");
+
+pinMode(LED_BUILTIN, OUTPUT);
+digitalWrite(LED_BUILTIN, LOW);
+
+// Initialize EEPROM
+EEPROM.begin(1024);
+loadConfiguration();
+
+// Initialize UART
+initializeUART();
+
+// Initialize WiFi
+initializeWiFi();
+
+// Initialize servers
+initializeServers();
+
+Serial.println("System initialized successfully!");
+blinkLED(3, 200);
+}
+
+void loop() {
+// Handle WiFi connections
+handleWiFiConnections();
+
+// Handle NTRIP connection
+handleNTRIPConnection();
+
+// Handle web server
+webServer.handleClient();
+dnsServer.processNextRequest();
+
+// Handle TCP/UDP servers
+handleTCPServer();
+handleUDPServer();
+
+// Handle data forwarding
+handleDataForwarding();
+
+// Update system status
+updateSystemStatus();
+
+// Small delay to prevent watchdog issues
+yield();
+delay(1);
+}
+
+void loadConfiguration() {
+// Load from EEPROM with magic number validation
+uint32_t magic;
+EEPROM.get(0, magic);
+
+if (magic == 0xDEADBEEF) {
+EEPROM.get(4, networkConfig);
+EEPROM.get(4 + sizeof(networkConfig), ntripConfig);
+EEPROM.get(4 + sizeof(networkConfig) + sizeof(ntripConfig), uartConfig);
+EEPROM.get(4 + sizeof(networkConfig) + sizeof(ntripConfig) + sizeof(uartConfig), serverConfig);
+Serial.println("Configuration loaded from EEPROM");
+} else {
+Serial.println("Using default configuration");
+saveConfiguration();
+}
+}
+
+void saveConfiguration() {
+uint32_t magic = 0xDEADBEEF;
+EEPROM.put(0, magic);
+EEPROM.put(4, networkConfig);
+EEPROM.put(4 + sizeof(networkConfig), ntripConfig);
+EEPROM.put(4 + sizeof(networkConfig) + sizeof(ntripConfig), uartConfig);
+EEPROM.put(4 + sizeof(networkConfig) + sizeof(ntripConfig) + sizeof(uartConfig), serverConfig);
+EEPROM.commit();
+Serial.println("Configuration saved to EEPROM");
+}
+
+void initializeUART() {
+Serial1.begin(uartConfig.baud_rate, getSerialConfig(), UART_RX, UART_TX);
+Serial.printf("UART initialized: %ld baud, %d%c%d\n", 
+uartConfig.baud_rate, uartConfig.data_bits, 
+getParityChar(), uartConfig.stop_bits);
+}
+
+uint32_t getSerialConfig() {
+uint32_t config = SERIAL_8N1;
+
+// Data bits
+if (uartConfig.data_bits == 7) config &= ~UART_NB_BIT_MASK;
+
+// Parity
+if (uartConfig.parity == 1) config |= UART_PARITY_ODD;
+else if (uartConfig.parity == 2) config |= UART_PARITY_EVEN;
+
+// Stop bits
+if (uartConfig.stop_bits == 2) config |= UART_NB_STOP_BIT_2;
+
+return config;
+}
+
+char getParityChar() {
+switch (uartConfig.parity) {
+case 1: return 'O';
+case 2: return 'E';
+default: return 'N';
+}
+}
+
+void initializeWiFi() {
+WiFi.mode(WIFI_AP_STA);
+
+// Start Access Point
+if (networkConfig.ap_enabled) {
+WiFi.softAP(networkConfig.ap_ssid, networkConfig.ap_password);
+systemStatus.ap_active = true;
+Serial.printf("AP started: %s\n", networkConfig.ap_ssid);
+Serial.printf("AP IP: %s\n", WiFi.softAPIP().toString().c_str());
+}
+
+// Connect to WiFi network
+if (networkConfig.sta_enabled) {
+connectToWiFi();
+}
+}
+
+void connectToWiFi() {
+if (strlen(networkConfig.sta_ssid) > 0) {
+Serial.printf("Connecting to WiFi: %s\n", networkConfig.sta_ssid);
+WiFi.begin(networkConfig.sta_ssid, networkConfig.sta_password);
+
+int attempts = 0;
+while (WiFi.status() != WL_CONNECTED && attempts < 20) {
+delay(500);
+Serial.print(".");
+attempts++;
+blinkLED(1, 100);
+}
+
+if (WiFi.status() == WL_CONNECTED) {
+systemStatus.sta_connected = true;
+systemStatus.internet_available = checkInternetConnection();
+Serial.printf("\nWiFi connected! IP: %s\n", WiFi.localIP().toString().c_str());
+blinkLED(2, 300);
+} else {
+Serial.println("\nWiFi connection failed");
+systemStatus.sta_connected = false;
+}
+}
+}
+
+bool checkInternetConnection() {
+WiFiClient client;
+if (client.connect("8.8.8.8", 53, 3000)) {
+client.stop();
+return true;
+}
+return false;
+}
+
+void initializeServers() {
+// DNS Server for captive portal
+dnsServer.start(53, "*", WiFi.softAPIP());
+
+// Web server routes
+webServer.on("/", handleRoot);
+webServer.on("/config", HTTP_POST, handleConfigSave);
+webServer.on("/status", handleStatus);
+webServer.on("/restart", handleRestart);
+webServer.onNotFound(handleRoot); // Captive portal
+
+webServer.begin();
+Serial.println("Web server started");
+
+// TCP Server
+if (serverConfig.tcp_enabled) {
+tcpServer.begin();
+Serial.printf("TCP server started on port %d\n", serverConfig.tcp_port);
+}
+
+// UDP Server
+if (serverConfig.udp_enabled) {
+udpServer.begin(serverConfig.udp_port);
+Serial.printf("UDP server started on port %d\n", serverConfig.udp_port);
+}
+}
+
+void handleWiFiConnections() {
+static unsigned long lastCheck = 0;
+
+if (millis() - lastCheck > 10000) { // Check every 10 seconds
+lastCheck = millis();
+
+// Check STA connection
+if (networkConfig.sta_enabled && WiFi.status() != WL_CONNECTED) {
+if (millis() - lastWiFiReconnect > 30000) { // Reconnect every 30 seconds
+Serial.println("WiFi disconnected, attempting reconnection...");
+connectToWiFi();
+lastWiFiReconnect = millis();
+}
+systemStatus.sta_connected = false;
+systemStatus.internet_available = false;
+} else if (WiFi.status() == WL_CONNECTED) {
+systemStatus.sta_connected = true;
+systemStatus.internet_available = checkInternetConnection();
+}
+
+// Update AP status
+systemStatus.ap_active = (WiFi.getMode() == WIFI_AP_STA || WiFi.getMode() == WIFI_AP);
+}
+}
+
+void handleNTRIPConnection() {
+if (!ntripConfig.enabled || !systemStatus.internet_available) {
+systemStatus.ntrip_connected = false;
+return;
+}
+
+if (!ntripClient.connected()) {
+systemStatus.ntrip_connected = false;
+
+if (millis() - lastNTRIPReconnect > ntripConfig.reconnect_interval) {
+Serial.println("Connecting to NTRIP server...");
+
+if (ntripClient.connect(ntripConfig.server, ntripConfig.port)) {
+// Send NTRIP request
+String request = "GET /" + String(ntripConfig.mountpoint) + " HTTP/1.0\r\n";
+request += "User-Agent: ESP32-NTRIP-Bridge/1.0\r\n";
+request += "Authorization: Basic ";
+request += base64::encode(String(ntripConfig.username) + ":" + String(ntripConfig.password));
+request += "\r\n\r\n";
+
+ntripClient.print(request);
+
+// Wait for response
+unsigned long timeout = millis() + 5000;
+while (ntripClient.available() == 0 && millis() < timeout) {
+delay(50);
+}
+
+if (ntripClient.available()) {
+String response = ntripClient.readStringUntil('\n');
+if (response.indexOf("200") >= 0) {
+systemStatus.ntrip_connected = true;
+Serial.println("NTRIP connection established!");
+
+// Skip HTTP headers
+while (ntripClient.available() && ntripClient.readStringUntil('\n').length() > 1);
+} else {
+Serial.println("NTRIP server rejected connection");
+ntripClient.stop();
+}
+}
+} else {
+Serial.println("Failed to connect to NTRIP server");
+}
+
+lastNTRIPReconnect = millis();
+}
+} else {
+systemStatus.ntrip_connected = true;
+systemStatus.last_ntrip_data = millis();
+}
+}
+
+void handleTCPServer() {
+if (!serverConfig.tcp_enabled) return;
+
+// Accept new connections
+WiFiClient newClient = tcpServer.available();
+if (newClient) {
+// Find empty slot
+for (int i = 0; i < 5; i++) {
+if (!tcpClients[i] || !tcpClients[i].connected()) {
+tcpClients[i] = newClient;
+Serial.printf("New TCP client connected: %s\n", newClient.remoteIP().toString().c_str());
+break;
+}
+}
+}
+
+// Count active connections
+clientCount = 0;
+for (int i = 0; i < 5; i++) {
+if (tcpClients[i] && tcpClients[i].connected()) {
+clientCount++;
+}
+}
+systemStatus.connected_clients = clientCount;
+}
+
+void handleUDPServer() {
+if (!serverConfig.udp_enabled) return;
+
+int packetSize = udpServer.parsePacket();
+if (packetSize) {
+// Handle UDP packet if needed
+}
+}
+
+void handleDataForwarding() {
+// Forward NTRIP data to UART and clients
+if (ntripClient.connected() && ntripClient.available()) {
+int bytesRead = ntripClient.readBytes(ntripBuffer, sizeof(ntripBuffer));
+if (bytesRead > 0) {
+systemStatus.ntrip_bytes_received += bytesRead;
+ntripBytesLastSecond += bytesRead;
+
+// Send to UART
+Serial1.write(ntripBuffer, bytesRead);
+systemStatus.uart_bytes_sent += bytesRead;
+systemStatus.last_uart_data = millis();
+
+// Send to TCP clients
+if (serverConfig.tcp_enabled) {
+for (int i = 0; i < 5; i++) {
+if (tcpClients[i] && tcpClients[i].connected()) {
+tcpClients[i].write(ntripBuffer, bytesRead);
+}
+}
+}
+
+// Send to UDP (if target configured)
+if (serverConfig.udp_enabled && strlen(serverConfig.target_ip) > 0) {
+udpServer.beginPacket(serverConfig.target_ip, serverConfig.target_port);
+udpServer.write(ntripBuffer, bytesRead);
+udpServer.endPacket();
+}
+}
+}
+
+// Forward UART data to clients (if needed)
+if (Serial1.available()) {
+int bytesRead = Serial1.readBytes(uartBuffer, sizeof(uartBuffer));
+if (bytesRead > 0) {
+uartBytesLastSecond += bytesRead;
+
+// Forward to TCP clients or UDP as needed
+for (int i = 0; i < 5; i++) {
+if (tcpClients[i] && tcpClients[i].connected()) {
+tcpClients[i].write(uartBuffer, bytesRead);
+}
+}
+}
+}
+}
+
+void updateSystemStatus() {
+if (millis() - lastDataRateUpdate > 1000) { // Update every second
+systemStatus.data_rate_ntrip = ntripBytesLastSecond;
+systemStatus.data_rate_uart = uartBytesLastSecond;
+ntripBytesLastSecond = 0;
+uartBytesLastSecond = 0;
+lastDataRateUpdate = millis();
+}
+}
+
+void handleRoot() {
+String html = R"(<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>RTK-GPS NTRIP Bridge</title>
+<style>
+* {
+margin: 0;
+padding: 0;
+box-sizing: border-box;
+}
+
+body {
+font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+min-height: 100vh;
+color: white;
+overflow-x: hidden;
+}
+
+.container {
+max-width: 800px;
+margin: 0 auto;
+padding: 20px;
+animation: fadeIn 0.8s ease-in;
+}
+
+@keyframes fadeIn {
+from { opacity: 0; transform: translateY(30px); }
+to { opacity: 1; transform: translateY(0); }
+}
+
+.header {
+text-align: center;
+margin-bottom: 30px;
+animation: slideDown 1s ease-out;
+}
+
+@keyframes slideDown {
+from { transform: translateY(-50px); opacity: 0; }
+to { transform: translateY(0); opacity: 1; }
+}
+
+.card {
+background: rgba(255, 255, 255, 0.1);
+backdrop-filter: blur(10px);
+border-radius: 20px;
+padding: 25px;
+margin-bottom: 20px;
+border: 1px solid rgba(255, 255, 255, 0.2);
+transition: transform 0.3s ease, box-shadow 0.3s ease;
+}
+
+.card:hover {
+transform: translateY(-5px);
+box-shadow: 0 10px 30px rgba(0, 0, 0, 0.3);
+}
+
+.status-grid {
+display: grid;
+grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+gap: 15px;
+margin-bottom: 20px;
+}
+
+.status-item {
+background: rgba(255, 255, 255, 0.1);
+border-radius: 15px;
+padding: 15px;
+text-align: center;
+transition: all 0.3s ease;
+}
+
+.status-item:hover {
+background: rgba(255, 255, 255, 0.2);
+transform: scale(1.05);
+}
+
+.status-value {
+font-size: 24px;
+font-weight: bold;
+margin-bottom: 5px;
+}
+
+.status-label {
+font-size: 12px;
+opacity: 0.8;
+text-transform: uppercase;
+letter-spacing: 1px;
+}
+
+.form-group {
+margin-bottom: 20px;
+}
+
+.form-group label {
+display: block;
+margin-bottom: 5px;
+font-weight: 600;
+font-size: 14px;
+}
+
+.form-group input, .form-group select {
+width: 100%;
+padding: 12px;
+border: none;
+border-radius: 10px;
+background: rgba(255, 255, 255, 0.1);
+color: white;
+font-size: 16px;
+transition: all 0.3s ease;
+}
+
+.form-group input::placeholder {
+color: rgba(255, 255, 255, 0.6);
+}
+
+.form-group input:focus, .form-group select:focus {
+outline: none;
+background: rgba(255, 255, 255, 0.2);
+transform: scale(1.02);
+}
+
+.btn {
+background: linear-gradient(135deg, #ff6b6b, #feca57);
+border: none;
+padding: 15px 30px;
+border-radius: 25px;
+color: white;
+font-weight: bold;
+cursor: pointer;
+transition: all 0.3s ease;
+text-decoration: none;
+display: inline-block;
+margin: 5px;
+}
+
+.btn:hover {
+transform: translateY(-3px);
+box-shadow: 0 10px 20px rgba(255, 107, 107, 0.3);
+}
+
+.btn-secondary {
+background: linear-gradient(135deg, #74b9ff, #0984e3);
+}
+
+.btn-danger {
+background: linear-gradient(135deg, #e17055, #d63031);
+}
+
+.section-title {
+font-size: 18px;
+font-weight: bold;
+margin-bottom: 15px;
+color: #fff;
+border-bottom: 2px solid rgba(255, 255, 255, 0.3);
+padding-bottom: 10px;
+}
+
+.online { color: #00ff88; }
+.offline { color: #ff4757; }
+
+.data-rate {
+font-family: 'Courier New', monospace;
+background: rgba(0, 0, 0, 0.3);
+padding: 5px 10px;
+border-radius: 5px;
+display: inline-block;
+}
+
+@media (max-width: 600px) {
+.container {
+padding: 15px;
+}
+
+.status-grid {
+grid-template-columns: 1fr;
+}
+
+.btn {
+width: 100%;
+margin: 5px 0;
+}
+}
+
+.pulse {
+animation: pulse 2s infinite;
+}
+
+@keyframes pulse {
+0% { transform: scale(1); }
+50% { transform: scale(1.05); }
+100% { transform: scale(1); }
+}
+</style>
+</head>
+<body>
+<div class="container">
+<div class="header">
+<h1>🛰️ RTK-GPS NTRIP Bridge</h1>
+<p>Professional Grade GNSS Correction System</p>
+</div>
+
+<div class="card">
+<h2 class="section-title">📊 System Status</h2>
+<div class="status-grid" id="statusGrid">
+<div class="status-item pulse">
+<div class="status-value" id="wifiStatus">⏳</div>
+<div class="status-label">WiFi STA</div>
+</div>
+<div class="status-item">
+<div class="status-value" id="ntripStatus">⏳</div>
+<div class="status-label">NTRIP</div>
+</div>
+<div class="status-item">
+<div class="status-value" id="clientCount">0</div>
+<div class="status-label">Clients</div>
+</div>
+<div class="status-item">
+<div class="status-value data-rate" id="dataRate">0 B/s</div>
+<div class="status-label">Data Rate</div>
+</div>
+</div>
+</div>
+
+<form id="configForm" onsubmit="saveConfig(event)">
+<div class="card">
+<h2 class="section-title">📶 WiFi Configuration</h2>
+<div class="form-group">
+<label>Station SSID:</label>
+<input type="text" name="sta_ssid" placeholder="WiFi Network Name" value=")";
+html += networkConfig.sta_ssid;
+html += R"(">
+</div>
+<div class="form-group">
+<label>Station Password:</label>
+<input type="password" name="sta_password" placeholder="WiFi Password" value=")";
+html += networkConfig.sta_password;
+html += R"(">
+</div>
+</div>
+
+<div class="card">
+<h2 class="section-title">🌐 NTRIP Configuration</h2>
+<div class="form-group">
+<label>Server:</label>
+<input type="text" name="ntrip_server" placeholder="NTRIP Server" value=")";
+html += ntripConfig.server;
+html += R"(">
+</div>
+<div class="form-group">
+<label>Port:</label>
+<input type="number" name="ntrip_port" placeholder="Port" value=")";
+html += String(ntripConfig.port);
+html += R"(">
+</div>
+<div class="form-group">
+<label>Username:</label>
+<input type="text" name="ntrip_username" placeholder="Username" value=")";
+html += ntripConfig.username;
+html += R"(">
+</div>
+<div class="form-group">
+<label>Password:</label>
+<input type="password" name="ntrip_password" placeholder="Password" value=")";
+html += ntripConfig.password;
+html += R"(">
+</div>
+<div class="form-group">
+<label>Mountpoint:</label>
+<input type="text" name="ntrip_mountpoint" placeholder="Mountpoint" value=")";
+html += ntripConfig.mountpoint;
+html += R"(">
+</div>
+</div>
+
+<div class="card">
+<h2 class="section-title">⚙️ UART Configuration</h2>
+<div class="form-group">
+<label>Baud Rate:</label>
+<select name="uart_baud">
+<option value="9600")";
+if (uartConfig.baud_rate == 9600) html += " selected";
+html += R"(>9600</option>
+<option value="19200")";
+if (uartConfig.baud_rate == 19200) html += " selected";
+html += R"(>19200</option>
+<option value="38400")";
+if (uartConfig.baud_rate == 38400) html += " selected";
+html += R"(>38400</option>
+<option value="57600")";
+if (uartConfig.baud_rate == 57600) html += " selected";
+html += R"(>57600</option>
+<option value="115200")";
+if (uartConfig.baud_rate == 115200) html += " selected";
+html += R"(>115200</option>
+<option value="230400")";
+if (uartConfig.baud_rate == 230400) html += " selected";
+html += R"(>230400</option>
+</select>
+</div>
+<div class="form-group">
+<label>Parity:</label>
+<select name="uart_parity">
+<option value="0")";
+if (uartConfig.parity == 0) html += " selected";
+html += R"(>None</option>
+<option value="1")";
+if (uartConfig.parity == 1) html += " selected";
+html += R"(>Odd</option>
+<option value="2")";
+if (uartConfig.parity == 2) html += " selected";
+html += R"(>Even</option>
+</select>
+</div>
+</div>
+
+<div class="card">
+<h2 class="section-title">🔧 Server Configuration</h2>
+<div class="form-group">
+<label>TCP Port:</label>
+<input type="number" name="tcp_port" placeholder="TCP Port" value=")";
+html += String(serverConfig.tcp_port);
+html += R"(">
+</div>
+<div class="form-group">
+<label>UDP Port:</label>
+<input type="number" name="udp_port" placeholder="UDP Port" value=")";
+html += String(serverConfig.udp_port);
+html += R"(">
+</div>
+</div>
+
+<div class="card" style="text-align: center;">
+<button type="submit" class="btn">💾 Save Configuration</button>
+<button type="button" class="btn btn-secondary" onclick="location.reload()">🔄 Refresh</button>
+<button type="button" class="btn btn-danger" onclick="restart()">🔥 Restart Device</button>
+</div>
+</form>
+</div>
+
+<script>
+function updateStatus() {
+fetch('/status')
+.then(response => response.json())
+.then(data => {
+document.getElementById('wifiStatus').innerHTML = data.sta_connected ? 
+'<span class="online">🟢 Online</span>' : '<span class="offline">🔴 Offline</span>';
+
+document.getElementById('ntripStatus').innerHTML = data.ntrip_connected ? 
+'<span class="online">🟢 Connected</span>' : '<span class="offline">🔴 Disconnected</span>';
+
+document.getElementById('clientCount').textContent = data.connected_clients;
+document.getElementById('dataRate').textContent = formatBytes(data.data_rate_ntrip) + '/s';
+})
+.catch(error => console.error('Status update failed:', error));
+}
+
+function formatBytes(bytes) {
+if (bytes === 0) return '0 B';
+const k = 1024;
+const sizes = ['B', 'KB', 'MB', 'GB'];
+const i = Math.floor(Math.log(bytes) / Math.log(k));
+return parseFloat((bytes / Math.pow(k, i)).toFixed(2)) + ' ' + sizes[i];
+}
+
+function saveConfig(event) {
+event.preventDefault();
+const formData = new FormData(event.target);
+const data = Object.fromEntries(formData.entries());
+
+fetch('/config', {
+method: 'POST',
+headers: {
+'Content-Type': 'application/json',
+},
+body: JSON.stringify(data)
+})
+.then(response => response.text())
+.then(data => {
+alert('Configuration saved! Device will restart in 3 seconds.');
+setTimeout(() => location.reload(), 3000);
+})
+.catch(error => {
+console.error('Save failed:', error);
+alert('Failed to save configuration!');
+});
+}
+
+function restart() {
+if (confirm('Are you sure you want to restart the device?')) {
+fetch('/restart', { method: 'POST' })
+.then(() => {
+alert('Device is restarting... Please wait 30 seconds before reconnecting.');
+setTimeout(() => location.reload(), 30000);
+})
+.catch(error => console.error('Restart failed:', error));
+}
+}
+
+// Auto-update status every 2 seconds
+setInterval(updateStatus, 2000);
+
+// Initial status update
+updateStatus();
+</script>
+</body>
+</html>)";
+
+webServer.send(200, "text/html", html);
+}
+
+void handleStatus() {
+DynamicJsonDocument doc(512);
+
+doc["ap_active"] = systemStatus.ap_active;
+doc["sta_connected"] = systemStatus.sta_connected;
+doc["internet_available"] = systemStatus.internet_available;
+doc["ntrip_connected"] = systemStatus.ntrip_connected;
+doc["connected_clients"] = systemStatus.connected_clients;
+doc["ntrip_bytes_received"] = systemStatus.ntrip_bytes_received;
+doc["uart_bytes_sent"] = systemStatus.uart_bytes_sent;
+doc["data_rate_ntrip"] = systemStatus.data_rate_ntrip;
+doc["data_rate_uart"] = systemStatus.data_rate_uart;
+doc["uptime"] = millis() / 1000;
+
+String jsonResponse;
+serializeJson(doc, jsonResponse);
+
+webServer.send(200, "application/json", jsonResponse);
+}
+
+void handleConfigSave() {
+if (webServer.hasArg("plain")) {
+DynamicJsonDocument doc(1024);
+deserializeJson(doc, webServer.arg("plain"));
+
+// Update WiFi configuration
+if (doc.containsKey("sta_ssid")) {
+strlcpy(networkConfig.sta_ssid, doc["sta_ssid"], sizeof(networkConfig.sta_ssid));
+}
+if (doc.containsKey("sta_password")) {
+strlcpy(networkConfig.sta_password, doc["sta_password"], sizeof(networkConfig.sta_password));
+}
+
+// Update NTRIP configuration
+if (doc.containsKey("ntrip_server")) {
+strlcpy(ntripConfig.server, doc["ntrip_server"], sizeof(ntripConfig.server));
+}
+if (doc.containsKey("ntrip_port")) {
+ntripConfig.port = doc["ntrip_port"];
+}
+if (doc.containsKey("ntrip_username")) {
+strlcpy(ntripConfig.username, doc["ntrip_username"], sizeof(ntripConfig.username));
+}
+if (doc.containsKey("ntrip_password")) {
+strlcpy(ntripConfig.password, doc["ntrip_password"], sizeof(ntripConfig.password));
+}
+if (doc.containsKey("ntrip_mountpoint")) {
+strlcpy(ntripConfig.mountpoint, doc["ntrip_mountpoint"], sizeof(ntripConfig.mountpoint));
+}
+
+// Update UART configuration
+if (doc.containsKey("uart_baud")) {
+long newBaud = doc["uart_baud"];
+if (newBaud != uartConfig.baud_rate) {
+uartConfig.baud_rate = newBaud;
+Serial1.end();
+initializeUART();
+}
+}
+if (doc.containsKey("uart_parity")) {
+int newParity = doc["uart_parity"];
+if (newParity != uartConfig.parity) {
+uartConfig.parity = newParity;
+Serial1.end();
+initializeUART();
+}
+}
+
+// Update server configuration
+if (doc.containsKey("tcp_port")) {
+int newPort = doc["tcp_port"];
+if (newPort != serverConfig.tcp_port) {
+serverConfig.tcp_port = newPort;
+tcpServer.end();
+tcpServer.begin(newPort);
+}
+}
+if (doc.containsKey("udp_port")) {
+int newPort = doc["udp_port"];
+if (newPort != serverConfig.udp_port) {
+serverConfig.udp_port = newPort;
+udpServer.stop();
+udpServer.begin(newPort);
+}
+}
+
+// Save configuration to EEPROM
+saveConfiguration();
+
+webServer.send(200, "text/plain", "Configuration saved successfully!");
+
+// Restart in 3 seconds to apply WiFi changes
+delay(3000);
+ESP.restart();
+} else {
+webServer.send(400, "text/plain", "No configuration data received!");
+}
+}
+
+void handleRestart() {
+webServer.send(200, "text/plain", "Restarting device...");
+delay(1000);
+ESP.restart();
+}
+
+void blinkLED(int count, int delayMs) {
+for (int i = 0; i < count; i++) {
+digitalWrite(LED_BUILTIN, HIGH);
+delay(delayMs);
+digitalWrite(LED_BUILTIN, LOW);
+delay(delayMs);
+}
+}
+
+
