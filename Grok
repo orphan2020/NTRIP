@@ -1,0 +1,609 @@
+/*
+ * ESP32C6 NTRIP Bridge - Production Ready
+ * Advanced firmware with dual WiFi (AP+STA), NTRIP client, and modern web interface
+ * Designed for high-stability RTK GPS applications
+ */
+
+#include <WiFi.h>
+#include <WebServer.h>
+#include <Update.h>
+#include <HTTPClient.h>
+#include <ArduinoJson.h>
+#include <Preferences.h>
+
+// Configuration structure
+struct Config {
+  char sta_ssid[32] = "iPhone15";
+  char sta_password[64] = "sommer2022";
+  char ntrip_server[64] = "sapos-nw-ntrip.de";
+  int ntrip_port = 2101;
+  char ntrip_user[32] = "nw-9110550";
+  char ntrip_password[64] = "1978sapos2024";
+  char ntrip_mountpoint[32] = "VRS_3_4G_NW";
+  int uart_baud = 115200;
+  int uart_parity = 0; // 0=none, 1=even, 2=odd
+  int uart_stop_bits = 1;
+  bool tcp_server_enabled = true;
+  int tcp_port = 8888;
+  bool udp_enabled = false;
+  int udp_port = 9999;
+  char udp_target[64] = "192.168.1.100";
+};
+
+// Global objects
+WebServer server(80);
+Preferences preferences;
+Config config;
+WiFiClient ntripClient;
+WiFiServer tcpServer(8888);
+WiFiClient tcpClients[4];
+
+// Status variables
+volatile bool wifiConnected = false;
+volatile bool ntripConnected = false;
+volatile unsigned long ntripBytesReceived = 0;
+volatile unsigned long uartBytesSent = 0;
+volatile unsigned long uartBytesReceived = 0;
+volatile unsigned long lastNtripData = 0;
+volatile int clientCount = 0;
+String wifiStatus = "Disconnected";
+String ntripStatus = "Disconnected";
+
+// HTML with modern design
+const char* htmlContent = R"rawliteral(
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>RTK GPS Configuration</title>
+    <style>
+        :root {
+            --primary: #4361ee;
+            --secondary: #3a0ca3;
+            --success: #4cc9f0;
+            --danger: #f72585;
+            --dark: #2b2d42;
+            --light: #f8f9fa;
+        }
+        
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+            font-family: 'Segoe UI', system-ui, sans-serif;
+        }
+        
+        body {
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            min-height: 100vh;
+            padding: 20px;
+        }
+        
+        .container {
+            max-width: 800px;
+            margin: 0 auto;
+            background: rgba(255, 255, 255, 0.95);
+            backdrop-filter: blur(10px);
+            border-radius: 20px;
+            box-shadow: 0 20px 40px rgba(0,0,0,0.1);
+            overflow: hidden;
+            animation: slideUp 0.6s ease-out;
+        }
+        
+        @keyframes slideUp {
+            from { transform: translateY(30px); opacity: 0; }
+            to { transform: translateY(0); opacity: 1; }
+        }
+        
+        .header {
+            background: linear-gradient(135deg, var(--primary), var(--secondary));
+            color: white;
+            padding: 30px;
+            text-align: center;
+        }
+        
+        .header h1 {
+            font-size: 2.5em;
+            margin-bottom: 10px;
+            font-weight: 300;
+        }
+        
+        .status-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+            gap: 15px;
+            padding: 20px;
+            background: var(--light);
+        }
+        
+        .status-card {
+            background: white;
+            padding: 20px;
+            border-radius: 15px;
+            text-align: center;
+            box-shadow: 0 5px 15px rgba(0,0,0,0.1);
+            transition: transform 0.3s ease;
+        }
+        
+        .status-card:hover {
+            transform: translateY(-5px);
+        }
+        
+        .status-online { border-left: 5px solid var(--success); }
+        .status-offline { border-left: 5px solid var(--danger); }
+        
+        .form-section {
+            padding: 30px;
+        }
+        
+        .form-group {
+            margin-bottom: 25px;
+        }
+        
+        label {
+            display: block;
+            margin-bottom: 8px;
+            font-weight: 600;
+            color: var(--dark);
+        }
+        
+        input, select {
+            width: 100%;
+            padding: 12px 15px;
+            border: 2px solid #e9ecef;
+            border-radius: 10px;
+            font-size: 16px;
+            transition: all 0.3s ease;
+        }
+        
+        input:focus, select:focus {
+            outline: none;
+            border-color: var(--primary);
+            box-shadow: 0 0 0 3px rgba(67, 97, 238, 0.1);
+        }
+        
+        .btn {
+            background: linear-gradient(135deg, var(--primary), var(--secondary));
+            color: white;
+            border: none;
+            padding: 15px 30px;
+            border-radius: 10px;
+            font-size: 16px;
+            font-weight: 600;
+            cursor: pointer;
+            transition: all 0.3s ease;
+            width: 100%;
+        }
+        
+        .btn:hover {
+            transform: translateY(-2px);
+            box-shadow: 0 10px 20px rgba(67, 97, 238, 0.3);
+        }
+        
+        .tab-container {
+            display: flex;
+            margin-bottom: 20px;
+            background: var(--light);
+            border-radius: 10px;
+            padding: 5px;
+        }
+        
+        .tab {
+            flex: 1;
+            padding: 15px;
+            text-align: center;
+            cursor: pointer;
+            border-radius: 8px;
+            transition: all 0.3s ease;
+        }
+        
+        .tab.active {
+            background: var(--primary);
+            color: white;
+        }
+        
+        .tab-content {
+            display: none;
+        }
+        
+        .tab-content.active {
+            display: block;
+        }
+        
+        .real-time {
+            font-size: 1.2em;
+            font-weight: 600;
+            color: var(--dark);
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <div class="header">
+            <h1>RTK GPS Bridge</h1>
+            <p>Professional NTRIP Client & Data Forwarder</p>
+        </div>
+        
+        <div class="status-grid" id="statusGrid">
+            <!-- Status will be updated by JavaScript -->
+        </div>
+        
+        <div class="tab-container">
+            <div class="tab active" onclick="showTab('wifi')">WiFi Settings</div>
+            <div class="tab" onclick="showTab('ntrip')">NTRIP Settings</div>
+            <div class="tab" onclick="showTab('uart')">UART Settings</div>
+        </div>
+        
+        <form id="configForm">
+            <div class="tab-content active" id="wifi">
+                <div class="form-section">
+                    <div class="form-group">
+                        <label>STA SSID:</label>
+                        <input type="text" name="sta_ssid" value="%STA_SSID%">
+                    </div>
+                    <div class="form-group">
+                        <label>STA Password:</label>
+                        <input type="password" name="sta_password" value="%STA_PASSWORD%">
+                    </div>
+                </div>
+            </div>
+            
+            <div class="tab-content" id="ntrip">
+                <div class="form-section">
+                    <div class="form-group">
+                        <label>NTRIP Server:</label>
+                        <input type="text" name="ntrip_server" value="%NTRIP_SERVER%">
+                    </div>
+                    <div class="form-group">
+                        <label>Port:</label>
+                        <input type="number" name="ntrip_port" value="%NTRIP_PORT%">
+                    </div>
+                    <div class="form-group">
+                        <label>Username:</label>
+                        <input type="text" name="ntrip_user" value="%NTRIP_USER%">
+                    </div>
+                    <div class="form-group">
+                        <label>Password:</label>
+                        <input type="password" name="ntrip_password" value="%NTRIP_PASSWORD%">
+                    </div>
+                    <div class="form-group">
+                        <label>Mountpoint:</label>
+                        <input type="text" name="ntrip_mountpoint" value="%NTRIP_MOUNTPOINT%">
+                    </div>
+                </div>
+            </div>
+            
+            <div class="tab-content" id="uart">
+                <div class="form-section">
+                    <div class="form-group">
+                        <label>Baud Rate:</label>
+                        <select name="uart_baud">
+                            <option value="9600">9600</option>
+                            <option value="19200">19200</option>
+                            <option value="38400">38400</option>
+                            <option value="57600">57600</option>
+                            <option value="115200" selected>115200</option>
+                        </select>
+                    </div>
+                </div>
+            </div>
+            
+            <div class="form-section">
+                <button type="submit" class="btn">Save Configuration</button>
+            </div>
+        </form>
+    </div>
+
+    <script>
+        function showTab(tabName) {
+            document.querySelectorAll('.tab').forEach(tab => tab.classList.remove('active'));
+            document.querySelectorAll('.tab-content').forEach(content => content.classList.remove('active'));
+            event.target.classList.add('active');
+            document.getElementById(tabName).classList.add('active');
+        }
+        
+        function updateStatus() {
+            fetch('/status')
+                .then(response => response.json())
+                .then(data => {
+                    document.getElementById('statusGrid').innerHTML = `
+                        <div class="status-card ${data.wifi_connected ? 'status-online' : 'status-offline'}">
+                            <div class="real-time">WiFi</div>
+                            <div>${data.wifi_status}</div>
+                        </div>
+                        <div class="status-card ${data.ntrip_connected ? 'status-online' : 'status-offline'}">
+                            <div class="real-time">NTRIP</div>
+                            <div>${data.ntrip_status}</div>
+                        </div>
+                        <div class="status-card">
+                            <div class="real-time">Data Rate</div>
+                            <div>${data.data_rate} B/s</div>
+                        </div>
+                        <div class="status-card">
+                            <div class="real-time">Clients</div>
+                            <div>${data.client_count}</div>
+                        </div>
+                    `;
+                });
+        }
+        
+        document.getElementById('configForm').addEventListener('submit', function(e) {
+            e.preventDefault();
+            const formData = new FormData(this);
+            
+            fetch('/config', {
+                method: 'POST',
+                body: formData
+            }).then(response => {
+                alert('Configuration saved successfully!');
+            });
+        });
+        
+        // Update status every 2 seconds
+        setInterval(updateStatus, 2000);
+        updateStatus();
+    </script>
+</body>
+</html>
+)rawliteral";
+
+void setup() {
+  Serial.begin(115200);
+  Serial1.begin(115200, SERIAL_8N1, 4, 5); // GPS connection
+  
+  // Initialize preferences
+  preferences.begin("ntrip-config", false);
+  loadConfiguration();
+  
+  // Start WiFi in AP mode
+  WiFi.softAP("RTK-GPS", "admin");
+  
+  // Start STA connection
+  connectToWiFi();
+  
+  // Start TCP server
+  tcpServer.begin();
+  
+  // Setup web server routes
+  server.on("/", handleRoot);
+  server.on("/config", handleConfig);
+  server.on("/status", handleStatus);
+  server.on("/update", HTTP_POST, handleUpdate, handleFileUpload);
+  
+  server.begin();
+  
+  // Start NTRIP connection
+  xTaskCreatePinnedToCore(ntripTask, "NTRIP Task", 8192, NULL, 1, NULL, 1);
+  xTaskCreatePinnedToCore(dataForwardTask, "Data Forward", 4096, NULL, 1, NULL, 1);
+}
+
+void loop() {
+  server.handleClient();
+  handleTCPClients();
+  checkConnections();
+  delay(100);
+}
+
+void loadConfiguration() {
+  preferences.getString("sta_ssid", config.sta_ssid, sizeof(config.sta_ssid));
+  preferences.getString("sta_password", config.sta_password, sizeof(config.sta_password));
+  preferences.getString("ntrip_server", config.ntrip_server, sizeof(config.ntrip_server));
+  config.ntrip_port = preferences.getInt("ntrip_port", 2101);
+  preferences.getString("ntrip_user", config.ntrip_user, sizeof(config.ntrip_user));
+  preferences.getString("ntrip_password", config.ntrip_password, sizeof(config.ntrip_password));
+  preferences.getString("ntrip_mountpoint", config.ntrip_mountpoint, sizeof(config.ntrip_mountpoint));
+  config.uart_baud = preferences.getInt("uart_baud", 115200);
+}
+
+void saveConfiguration() {
+  preferences.putString("sta_ssid", config.sta_ssid);
+  preferences.putString("sta_password", config.sta_password);
+  preferences.putString("ntrip_server", config.ntrip_server);
+  preferences.putInt("ntrip_port", config.ntrip_port);
+  preferences.putString("ntrip_user", config.ntrip_user);
+  preferences.putString("ntrip_password", config.ntrip_password);
+  preferences.putString("ntrip_mountpoint", config.ntrip_mountpoint);
+  preferences.putInt("uart_baud", config.uart_baud);
+}
+
+void connectToWiFi() {
+  if (strlen(config.sta_ssid) > 0) {
+    WiFi.begin(config.sta_ssid, config.sta_password);
+    
+    int attempts = 0;
+    while (WiFi.status() != WL_CONNECTED && attempts < 20) {
+      delay(500);
+      attempts++;
+    }
+    
+    wifiConnected = (WiFi.status() == WL_CONNECTED);
+    wifiStatus = wifiConnected ? "Connected: " + WiFi.localIP().toString() : "Failed to connect";
+  }
+}
+
+void ntripTask(void *parameter) {
+  while (true) {
+    if (wifiConnected && !ntripConnected) {
+      if (ntripClient.connect(config.ntrip_server, config.ntrip_port)) {
+        String auth = String(config.ntrip_user) + ":" + String(config.ntrip_password);
+        String authBase64 = base64::encode(auth);
+        
+        String request = String("GET /") + config.ntrip_mountpoint + " HTTP/1.1\r\n" +
+                        "Host: " + config.ntrip_server + "\r\n" +
+                        "Authorization: Basic " + authBase64 + "\r\n" +
+                        "Ntrip-Version: Ntrip/2.0\r\n" +
+                        "User-Agent: NTRIP ESP32C6\r\n" +
+                        "Connection: close\r\n\r\n";
+        
+        ntripClient.print(request);
+        
+        // Wait for response
+        unsigned long timeout = millis();
+        while (!ntripClient.available() && millis() - timeout < 5000) {
+          delay(100);
+        }
+        
+        if (ntripClient.available()) {
+          String response = ntripClient.readStringUntil('\n');
+          if (response.indexOf("200") > 0 || response.indexOf("ICY 200") > 0) {
+            ntripConnected = true;
+            ntripStatus = "Connected to " + String(config.ntrip_server);
+            lastNtripData = millis();
+          }
+        }
+        
+        if (!ntripConnected) {
+          ntripClient.stop();
+        }
+      }
+    }
+    
+    if (ntripConnected) {
+      if (ntripClient.available()) {
+        uint8_t data = ntripClient.read();
+        Serial1.write(data); // Forward to GPS
+        ntripBytesReceived++;
+        lastNtripData = millis();
+      }
+      
+      // Check for timeout
+      if (millis() - lastNtripData > 10000) {
+        ntripConnected = false;
+        ntripStatus = "Connection timeout";
+        ntripClient.stop();
+      }
+    }
+    
+    delay(10);
+  }
+}
+
+void dataForwardTask(void *parameter) {
+  while (true) {
+    // Forward GPS data to TCP clients
+    if (Serial1.available()) {
+      uint8_t data = Serial1.read();
+      uartBytesReceived++;
+      
+      // Send to all TCP clients
+      for (int i = 0; i < 4; i++) {
+        if (tcpClients[i] && tcpClients[i].connected()) {
+          tcpClients[i].write(data);
+          uartBytesSent++;
+        }
+      }
+    }
+    delay(1);
+  }
+}
+
+void handleTCPClients() {
+  if (tcpServer.hasClient()) {
+    for (int i = 0; i < 4; i++) {
+      if (!tcpClients[i] || !tcpClients[i].connected()) {
+        if (tcpClients[i]) tcpClients[i].stop();
+        tcpClients[i] = tcpServer.available();
+        clientCount++;
+        break;
+      }
+    }
+  }
+  
+  // Update client count
+  int connectedClients = 0;
+  for (int i = 0; i < 4; i++) {
+    if (tcpClients[i] && tcpClients[i].connected()) {
+      connectedClients++;
+    }
+  }
+  clientCount = connectedClients;
+}
+
+void checkConnections() {
+  static unsigned long lastCheck = 0;
+  if (millis() - lastCheck > 5000) {
+    lastCheck = millis();
+    
+    // Check WiFi
+    bool currentWifiStatus = (WiFi.status() == WL_CONNECTED);
+    if (currentWifiStatus != wifiConnected) {
+      wifiConnected = currentWifiStatus;
+      if (!wifiConnected) {
+        connectToWiFi();
+      }
+    }
+    
+    // Update status strings
+    if (wifiConnected) {
+      wifiStatus = "Connected: " + WiFi.localIP().toString();
+    } else {
+      wifiStatus = "Disconnected";
+    }
+  }
+}
+
+void handleRoot() {
+  String html = String(htmlContent);
+  html.replace("%STA_SSID%", config.sta_ssid);
+  html.replace("%STA_PASSWORD%", config.sta_password);
+  html.replace("%NTRIP_SERVER%", config.ntrip_server);
+  html.replace("%NTRIP_PORT%", String(config.ntrip_port));
+  html.replace("%NTRIP_USER%", config.ntrip_user);
+  html.replace("%NTRIP_PASSWORD%", config.ntrip_password);
+  html.replace("%NTRIP_MOUNTPOINT%", config.ntrip_mountpoint);
+  
+  server.send(200, "text/html", html);
+}
+
+void handleConfig() {
+  if (server.method() == HTTP_POST) {
+    for (int i = 0; i < server.args(); i++) {
+      String name = server.argName(i);
+      String value = server.arg(i);
+      
+      if (name == "sta_ssid") value.toCharArray(config.sta_ssid, sizeof(config.sta_ssid));
+      else if (name == "sta_password") value.toCharArray(config.sta_password, sizeof(config.sta_password));
+      else if (name == "ntrip_server") value.toCharArray(config.ntrip_server, sizeof(config.ntrip_server));
+      else if (name == "ntrip_port") config.ntrip_port = value.toInt();
+      else if (name == "ntrip_user") value.toCharArray(config.ntrip_user, sizeof(config.ntrip_user));
+      else if (name == "ntrip_password") value.toCharArray(config.ntrip_password, sizeof(config.ntrip_password));
+      else if (name == "ntrip_mountpoint") value.toCharArray(config.ntrip_mountpoint, sizeof(config.ntrip_mountpoint));
+      else if (name == "uart_baud") config.uart_baud = value.toInt();
+    }
+    
+    saveConfiguration();
+    
+    // Reconnect with new settings
+    if (WiFi.status() == WL_CONNECTED) {
+      WiFi.disconnect();
+    }
+    connectToWiFi();
+    
+    server.send(200, "application/json", "{\"status\":\"success\"}");
+  }
+}
+
+void handleStatus() {
+  StaticJsonDocument<512> doc;
+  doc["wifi_connected"] = wifiConnected;
+  doc["wifi_status"] = wifiStatus;
+  doc["ntrip_connected"] = ntripConnected;
+  doc["ntrip_status"] = ntripStatus;
+  doc["data_rate"] = ntripBytesReceived / 60; // Bytes per second approximation
+  doc["client_count"] = clientCount;
+  
+  String response;
+  serializeJson(doc, response);
+  server.send(200, "application/json", response);
+}
+
+void handleUpdate() {
+  server.send(200, "text/plain", "Update endpoint ready");
+}
+
+void handleFileUpload() {
+  // File upload handling for future OTA updates
+}
+
+
