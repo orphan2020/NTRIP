@@ -1,0 +1,682 @@
+
+/*
+* ESP32-C6 NTRIP Bridge - Production-Ready Firmware
+* Version: 2.0.0
+* Purpose: High-stability NTRIP client for RTK GPS with UART bridge, dual WiFi (AP+STA), and modern web interface
+* Target: ESP32-C6 (Arduino Core 3.0+)
+*
+* Features:
+* - Dual WiFi: Always-on AP (captive portal) + STA with exponential backoff reconnection
+* - NTRIP client with Basic auth, timeout handling, and robust reconnection
+* - Configurable UART (baud, parity, stop bits) for GNSS device communication
+* - TCP/UDP servers for RTCM data forwarding
+* - Mobile-optimized web interface with WebSocket-based live status updates
+* - Persistent configuration using NVS (Preferences)
+* - OTA update support
+* - Detailed metrics (throughput, connection status)
+* - Watchdog-safe, no memory leaks
+*/
+
+#include 
+#include 
+#include 
+#include 
+#include 
+#include 
+#include 
+#include 
+#include 
+
+// ================== CONFIGURATION DEFAULTS ==================
+#define AP_SSID "RTK-GPS"
+#define AP_PASS "admin"
+#define DEFAULT_STA_SSID "iPhone15"
+#define DEFAULT_STA_PASS "sommer2022"
+#define DEFAULT_NTRIP_HOST "sapos-nw-ntrip.de"
+#define DEFAULT_NTRIP_PORT 2101
+#define DEFAULT_NTRIP_USER "nw-9110550"
+#define DEFAULT_NTRIP_PASS "1978sapos2024"
+#define DEFAULT_MOUNTPOINT "VRS_3_4G_NW"
+#define DEFAULT_UART_BAUD 115200
+#define DEFAULT_UART_PARITY 0 // 0=None, 1=Odd, 2=Even
+#define DEFAULT_UART_STOP_BITS 1
+#define WEB_PORT 80
+#define WEBSOCKET_PORT 81
+#define TCP_PORT 2101
+#define UDP_PORT 2102
+#define MAX_TCP_CLIENTS 5
+
+// ================== GLOBALS ==================
+WebServer server(WEB_PORT);
+DNSServer dnsServer;
+WebSocketsServer webSocket(WEBSOCKET_PORT);
+Preferences prefs;
+HardwareSerial gpsSerial(1); // UART1: GPIO 16 (RX), 17 (TX)
+
+// Configuration structure
+struct Config {
+char sta_ssid[32];
+char sta_password[64];
+char ntrip_host[64];
+uint16_t ntrip_port;
+char ntrip_user[32];
+char ntrip_password[64];
+char ntrip_mountpoint[32];
+uint32_t uart_baud;
+uint8_t uart_parity;
+uint8_t uart_stop_bits;
+uint16_t tcp_port;
+uint16_t udp_port;
+};
+Config config = {
+DEFAULT_STA_SSID, DEFAULT_STA_PASS,
+DEFAULT_NTRIP_HOST, DEFAULT_NTRIP_PORT,
+DEFAULT_NTRIP_USER, DEFAULT_NTRIP_PASS,
+DEFAULT_MOUNTPOINT, DEFAULT_UART_BAUD,
+DEFAULT_UART_PARITY, DEFAULT_UART_STOP_BITS,
+TCP_PORT, UDP_PORT
+};
+
+// Status variables
+struct Status {
+bool sta_connected = false;
+bool ntrip_connected = false;
+uint32_t ntrip_bytes_received = 0;
+uint32_t uart_bytes_sent = 0;
+uint32_t uart_bytes_received = 0;
+uint8_t tcp_clients = 0;
+float ntrip_data_rate = 0.0;
+float uart_data_rate = 0.0;
+unsigned long last_ntrip_data = 0;
+};
+Status status;
+
+// Network objects
+WiFiClient ntripClient;
+WiFiServer tcpServer(TCP_PORT);
+WiFiClient tcpClients[MAX_TCP_CLIENTS];
+WiFiUDP udpServer;
+
+// Timing and reconnection
+unsigned long lastStaConnectAttempt = 0;
+unsigned long lastNtripConnectAttempt = 0;
+unsigned long lastMetricsUpdate = 0;
+unsigned long staReconnectBackoff = 1000; // Exponential backoff for STA
+const uint32_t NTRIP_RECONNECT_INTERVAL = 5000;
+const uint32_t NTRIP_TIMEOUT = 10000;
+const uint32_t METRICS_INTERVAL = 1000;
+
+// ================== FUNCTION DECLARATIONS ==================
+void loadConfig();
+void saveConfig();
+void setupWiFi();
+void setupUART();
+void reconnectSTA();
+void connectNTRIP();
+void forwardData();
+void handleRoot();
+void handleConfig();
+void handleSave();
+void handleStatus();
+void handleNotFound();
+void handleUpdate();
+void handleFileUpload();
+void webSocketEvent(uint8_t num, WStype_t type, uint8_t *payload, size_t length);
+String getBase64Auth(const String &user, const String &pass);
+
+// ================== SETUP ==================
+void setup() {
+Serial.begin(115200);
+Serial.println("\n=== ESP32-C6 NTRIP Bridge v2.0.0 ===");
+
+// Load configuration from NVS
+prefs.begin("ntrip-config", false);
+loadConfig();
+
+// Initialize UART
+setupUART();
+
+// Initialize WiFi
+setupWiFi();
+
+// Start servers
+tcpServer.begin();
+tcpServer.setNoDelay(true);
+udpServer.begin(UDP_PORT);
+server.on("/", HTTP_GET, handleRoot);
+server.on("/config", HTTP_GET, handleConfig);
+server.on("/save", HTTP_POST, handleSave);
+server.on("/status", HTTP_GET, handleStatus);
+server.on("/update", HTTP_POST, handleUpdate, handleFileUpload);
+server.onNotFound(handleNotFound);
+server.begin();
+webSocket.begin();
+webSocket.onEvent(webSocketEvent);
+
+// Start mDNS
+if (MDNS.begin("rtk-gps")) {
+MDNS.addService("http", "tcp", WEB_PORT);
+MDNS.addService("ws", "tcp", WEBSOCKET_PORT);
+}
+
+// Start NTRIP and data forwarding tasks
+xTaskCreatePinnedToCore(ntripTask, "NTRIP Task", 8192, NULL, 1, NULL, 1);
+xTaskCreatePinnedToCore(dataForwardTask, "Data Forward", 4096, NULL, 1, NULL, 1);
+
+Serial.println("Setup complete.");
+}
+
+// ================== LOOP ==================
+void loop() {
+server.handleClient();
+webSocket.loop();
+dnsServer.processNextRequest();
+reconnectSTA();
+updateMetrics();
+delay(1);
+}
+
+// ================== CONFIGURATION ==================
+void loadConfig() {
+prefs.getString("sta_ssid", config.sta_ssid, sizeof(config.sta_ssid));
+prefs.getString("sta_password", config.sta_password, sizeof(config.sta_password));
+prefs.getString("ntrip_host", config.ntrip_host, sizeof(config.ntrip_host));
+config.ntrip_port = prefs.getUShort("ntrip_port", DEFAULT_NTRIP_PORT);
+prefs.getString("ntrip_user", config.ntrip_user, sizeof(config.ntrip_user));
+prefs.getString("ntrip_password", config.ntrip_password, sizeof(config.ntrip_password));
+prefs.getString("ntrip_mountpoint", config.ntrip_mountpoint, sizeof(config.ntrip_mountpoint));
+config.uart_baud = prefs.getUInt("uart_baud", DEFAULT_UART_BAUD);
+config.uart_parity = prefs.getUChar("uart_parity", DEFAULT_UART_PARITY);
+config.uart_stop_bits = prefs.getUChar("uart_stop_bits", DEFAULT_UART_STOP_BITS);
+config.tcp_port = prefs.getUShort("tcp_port", TCP_PORT);
+config.udp_port = prefs.getUShort("udp_port", UDP_PORT);
+}
+
+void saveConfig() {
+prefs.putString("sta_ssid", config.sta_ssid);
+prefs.putString("sta_password", config.sta_password);
+prefs.putString("ntrip_host", config.ntrip_host);
+prefs.putUShort("ntrip_port", config.ntrip_port);
+prefs.putString("ntrip_user", config.ntrip_user);
+prefs.putString("ntrip_password", config.ntrip_password);
+prefs.putString("ntrip_mountpoint", config.ntrip_mountpoint);
+prefs.putUInt("uart_baud", config.uart_baud);
+prefs.putUChar("uart_parity", config.uart_parity);
+prefs.putUChar("uart_stop_bits", config.uart_stop_bits);
+prefs.putUShort("tcp_port", config.tcp_port);
+prefs.putUShort("udp_port", config.udp_port);
+}
+
+// ================== WIFI ==================
+void setupWiFi() {
+WiFi.mode(WIFI_AP_STA);
+WiFi.softAPConfig(IPAddress(192, 168, 4, 1), IPAddress(192, 168, 4, 1), IPAddress(255, 255, 255, 0));
+WiFi.softAP(AP_SSID, AP_PASS);
+dnsServer.start(53, "*", WiFi.softAPIP());
+Serial.printf("AP started: %s (IP: %s)\n", AP_SSID, WiFi.softAPIP().toString().c_str());
+reconnectSTA();
+}
+
+void reconnectSTA() {
+if (strlen(config.sta_ssid) == 0) return;
+if (WiFi.status() == WL_CONNECTED) {
+status.sta_connected = true;
+staReconnectBackoff = 1000;
+return;
+}
+unsigned long now = millis();
+if (now - lastStaConnectAttempt = 0 || response.indexOf("ICY 200") >= 0) {
+status.ntrip_connected = true;
+Serial.println("NTRIP connected to " + String(config.ntrip_host));
+while (ntripClient.available() && ntripClient.readStringUntil('\n').length() > 1); // Skip headers
+} else {
+ntripClient.stop();
+}
+} else {
+ntripClient.stop();
+}
+}
+}
+
+if (status.ntrip_connected && ntripClient.connected()) {
+if (millis() - status.last_ntrip_data > NTRIP_TIMEOUT) {
+ntripClient.stop();
+status.ntrip_connected = false;
+Serial.println("NTRIP timeout, reconnecting...");
+}
+}
+
+vTaskDelay(10 / portTICK_PERIOD_MS);
+}
+}
+
+// ================== DATA FORWARDING ==================
+void dataForwardTask(void *parameter) {
+while (true) {
+// Forward NTRIP to UART and TCP/UDP clients
+if (status.ntrip_connected && ntripClient.available()) {
+uint8_t buffer[512];
+size_t len = ntripClient.readBytes(buffer, sizeof(buffer));
+if (len > 0) {
+status.ntrip_bytes_received += len;
+status.last_ntrip_data = millis();
+
+// Send to UART
+gpsSerial.write(buffer, len);
+status.uart_bytes_sent += len;
+
+// Send to TCP clients
+for (int i = 0; i 0) {
+status.uart_bytes_received += len;
+for (int i = 0; i 
+
+
+
+
+RTK GPS Bridge
+
+:root {
+--primary: #4361ee;
+--secondary: #3a0ca3;
+--success: #4cc9f0;
+--danger: #f72585;
+--dark: #2b2d42;
+--light: #f8f9fa;
+}
+* {
+margin: 0;
+padding: 0;
+box-sizing: border-box;
+font-family: 'Segoe UI', system-ui, sans-serif;
+}
+body {
+background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+min-height: 100vh;
+padding: 20px;
+}
+.container {
+max-width: 800px;
+margin: 0 auto;
+background: rgba(255, 255, 255, 0.95);
+backdrop-filter: blur(10px);
+border-radius: 20px;
+box-shadow: 0 20px 40px rgba(0,0,0,0.1);
+overflow: hidden;
+}
+.header {
+background: linear-gradient(135deg, var(--primary), var(--secondary));
+color: white;
+padding: 30px;
+text-align: center;
+}
+.header h1 {
+font-size: 2.5em;
+margin-bottom: 10px;
+font-weight: 300;
+}
+.status-grid {
+display: grid;
+grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+gap: 15px;
+padding: 20px;
+background: var(--light);
+}
+.status-card {
+background: white;
+padding: 20px;
+border-radius: 15px;
+text-align: center;
+box-shadow: 0 5px 15px rgba(0,0,0,0.1);
+transition: transform 0.3s ease;
+}
+.status-card:hover {
+transform: translateY(-5px);
+}
+.status-online { border-left: 5px solid var(--success); }
+.status-offline { border-left: 5px solid var(--danger); }
+.real-time { font-size: 1.2em; font-weight: 600; color: var(--dark); }
+.form-section { padding: 30px; }
+.form-group { margin-bottom: 25px; }
+label { display: block; margin-bottom: 8px; font-weight: 600; color: var(--dark); }
+input, select {
+width: 100%;
+padding: 12px 15px;
+border: 2px solid #e9ecef;
+border-radius: 10px;
+font-size: 16px;
+transition: all 0.3s ease;
+}
+input:focus, select:focus {
+outline: none;
+border-color: var(--primary);
+box-shadow: 0 0 0 3px rgba(67, 97, 238, 0.1);
+}
+.btn {
+background: linear-gradient(135deg, var(--primary), var(--secondary));
+color: white;
+border: none;
+padding: 15px 30px;
+border-radius: 10px;
+font-size: 16px;
+font-weight: 600;
+cursor: pointer;
+transition: all 0.3s ease;
+width: 100%;
+}
+.btn:hover {
+transform: translateY(-2px);
+box-shadow: 0 10px 20px rgba(67, 97, 238, 0.3);
+}
+.tab-container {
+display: flex;
+margin-bottom: 20px;
+background: var(--light);
+border-radius: 10px;
+padding: 5px;
+}
+.tab {
+flex: 1;
+padding: 15px;
+text-align: center;
+cursor: pointer;
+border-radius: 8px;
+transition: all 0.3s ease;
+}
+.tab.active { background: var(--primary); color: white; }
+.tab-content { display: none; }
+.tab-content.active { display: block; }
+
+
+
+
+
+🛰️ RTK GPS Bridge
+Professional NTRIP Client & Data Forwarder
+
+
+
+WiFi Settings
+NTRIP Settings
+UART Settings
+
+
+
+
+
+STA SSID:
+
+
+
+STA Password:
+
+
+
+
+
+
+
+NTRIP Server:
+
+
+
+Port:
+
+
+
+Username:
+
+
+
+Password:
+
+
+
+Mountpoint:
+
+
+
+
+
+
+
+Baud Rate:
+
+9600
+19200
+38400
+57600
+115200
+230400
+
+
+
+Parity:
+
+None
+Odd
+Even
+
+
+
+
+
+💾 Save & Reboot
+
+
+
+
+const ws = new WebSocket('ws://' + window.location.host + ':81');
+ws.onopen = () => console.log('WebSocket connected');
+ws.onmessage = (event) => {
+const data = JSON.parse(event.data);
+document.getElementById('statusGrid').innerHTML = `
+
+WiFi
+${data.sta_status}
+
+
+NTRIP
+${data.ntrip_status}
+
+
+Data Rate
+${formatBytes(data.ntrip_data_rate)}/s
+
+
+Clients
+${data.tcp_clients}
+
+`;
+};
+function formatBytes(bytes) {
+if (bytes === 0) return '0 B';
+const k = 1024;
+const sizes = ['B', 'KB', 'MB', 'GB'];
+const i = Math.floor(Math.log(bytes) / Math.log(k));
+return parseFloat((bytes / Math.pow(k, i)).toFixed(2)) + ' ' + sizes[i];
+}
+function showTab(tabName) {
+document.querySelectorAll('.tab').forEach(tab => tab.classList.remove('active'));
+document.querySelectorAll('.tab-content').forEach(content => content.classList.remove('active'));
+event.target.classList.add('active');
+document.getElementById(tabName).classList.add('active');
+}
+document.getElementById('configForm').addEventListener('submit', (e) => {
+e.preventDefault();
+const formData = new FormData(e.target);
+const data = Object.fromEntries(formData.entries());
+fetch('/save', {
+method: 'POST',
+headers: {'Content-Type': 'application/json'},
+body: JSON.stringify(data)
+}).then(() => {
+alert('Settings saved! Rebooting in 3 seconds...');
+setTimeout(() => location.reload(), 3000);
+}).catch(err => alert('Failed to save settings: ' + err));
+});
+
+
+
+)rawliteral";
+String processed = html;
+processed.replace("%STA_SSID%", config.sta_ssid);
+processed.replace("%STA_PASSWORD%", config.sta_password);
+processed.replace("%NTRIP_HOST%", config.ntrip_host);
+processed.replace("%NTRIP_PORT%", String(config.ntrip_port));
+processed.replace("%NTRIP_USER%", config.ntrip_user);
+processed.replace("%NTRIP_PASSWORD%", config.ntrip_password);
+processed.replace("%NTRIP_MOUNTPOINT%", config.ntrip_mountpoint);
+processed.replace("%PARITY_NONE%", config.uart_parity == 0 ? "selected" : "");
+processed.replace("%PARITY_ODD%", config.uart_parity == 1 ? "selected" : "");
+processed.replace("%PARITY_EVEN%", config.uart_parity == 2 ? "selected" : "");
+server.send(200, "text/html", processed);
+}
+
+void handleConfig() {
+DynamicJsonDocument doc(512);
+doc["sta_ssid"] = config.sta_ssid;
+doc["sta_password"] = config.sta_password;
+doc["ntrip_host"] = config.ntrip_host;
+doc["ntrip_port"] = config.ntrip_port;
+doc["ntrip_user"] = config.ntrip_user;
+doc["ntrip_password"] = config.ntrip_password;
+doc["ntrip_mountpoint"] = config.ntrip_mountpoint;
+doc["uart_baud"] = config.uart_baud;
+doc["uart_parity"] = config.uart_parity;
+doc["tcp_port"] = config.tcp_port;
+doc["udp_port"] = config.udp_port;
+String json;
+serializeJson(doc, json);
+server.send(200, "application/json", json);
+}
+
+void handleSave() {
+if (!server.hasArg("plain")) {
+server.send(400, "text/plain", "Bad Request");
+return;
+}
+DynamicJsonDocument doc(1024);
+DeserializationError error = deserializeJson(doc, server.arg("plain"));
+if (error) {
+server.send(400, "text/plain", "Invalid JSON");
+return;
+}
+
+strlcpy(config.sta_ssid, doc["sta_ssid"] | config.sta_ssid, sizeof(config.sta_ssid));
+strlcpy(config.sta_password, doc["sta_password"] | config.sta_password, sizeof(config.sta_password));
+strlcpy(config.ntrip_host, doc["ntrip_host"] | config.ntrip_host, sizeof(config.ntrip_host));
+config.ntrip_port = doc["ntrip_port"] | config.ntrip_port;
+strlcpy(config.ntrip_user, doc["ntrip_user"] | config.ntrip_user, sizeof(config.ntrip_user));
+strlcpy(config.ntrip_password, doc["ntrip_password"] | config.ntrip_password, sizeof(config.ntrip_password));
+strlcpy(config.ntrip_mountpoint, doc["ntrip_mountpoint"] | config.ntrip_mountpoint, sizeof(config.ntrip_mountpoint));
+uint32_t newBaud = doc["uart_baud"] | config.uart_baud;
+uint8_t newParity = doc["uart_parity"] | config.uart_parity;
+
+if (newBaud != config.uart_baud || newParity != config.uart_parity) {
+config.uart_baud = newBaud;
+config.uart_parity = newParity;
+gpsSerial.end();
+setupUART();
+}
+
+saveConfig();
+server.send(200, "application/json", "{\"status\":\"success\"}");
+delay(1000);
+ESP.restart();
+}
+
+void handleStatus() {
+DynamicJsonDocument doc(512);
+doc["sta_connected"] = status.sta_connected;
+doc["sta_status"] = status.sta_connected ? WiFi.localIP().toString() : "Disconnected";
+doc["ntrip_connected"] = status.ntrip_connected;
+doc["ntrip_status"] = status.ntrip_connected ? "Connected to " + String(config.ntrip_host) : "Disconnected";
+doc["ntrip_data_rate"] = status.ntrip_data_rate;
+doc["tcp_clients"] = status.tcp_clients;
+String json;
+serializeJson(doc, json);
+server.send(200, "application/json", json);
+}
+
+void handleNotFound() {
+if (captivePortal()) return;
+server.send(404, "text/plain", "Not Found");
+}
+
+void handleUpdate() {
+server.send(200, "text/plain", "Update endpoint ready");
+}
+
+void handleFileUpload() {
+HTTPUpload& upload = server.upload();
+static File updateFile;
+if (upload.status == UPLOAD_FILE_START) {
+if (Update.begin(UPDATE_SIZE_UNKNOWN)) {
+updateFile = SPIFFS.open("/update.bin", FILE_WRITE);
+}
+} else if (upload.status == UPLOAD_FILE_WRITE) {
+if (updateFile) updateFile.write(upload.buf, upload.currentSize);
+Update.write(upload.buf, upload.currentSize);
+} else if (upload.status == UPLOAD_FILE_END) {
+if (updateFile) updateFile.close();
+if (Update.end(true)) {
+server.send(200, "text/plain", "Update successful, rebooting...");
+delay(1000);
+ESP.restart();
+} else {
+server.send(500, "text/plain", "Update failed");
+}
+}
+}
+
+bool captivePortal() {
+if (!WiFi.softAPgetStationNum()) return false;
+String host = server.hostHeader();
+if (host != "192.168.4.1" && host.indexOf("rtk-gps") == -1) {
+server.sendHeader("Location", "http://192.168.4.1", true);
+server.send(302, "text/plain", "");
+return true;
+}
+return false;
+}
+
+void webSocketEvent(uint8_t num, WStype_t type, uint8_t *payload, size_t length) {
+if (type == WStype_CONNECTED) {
+sendWebSocketStatus();
+}
+}
+
+void sendWebSocketStatus() {
+DynamicJsonDocument doc(512);
+doc["sta_connected"] = status.sta_connected;
+doc["sta_status"] = status.sta_connected ? WiFi.localIP().toString() : "Disconnected";
+doc["ntrip_connected"] = status.ntrip_connected;
+doc["ntrip_status"] = status.ntrip_connected ? "Connected to " + String(config.ntrip_host) : "Disconnected";
+doc["ntrip_data_rate"] = status.ntrip_data_rate;
+doc["tcp_clients"] = status.tcp_clients;
+String json;
+serializeJson(doc, json);
+webSocket.broadcastTXT(json);
+}
+
+// ================== UTILITY FUNCTIONS ==================
+String getBase64Auth(const String &user, const String &pass) {
+String auth = user + ":" + pass;
+return base64::encode(auth);
+}
+
+void updateMetrics() {
+if (millis() - lastMetricsUpdate > METRICS_INTERVAL) {
+status.ntrip_data_rate = status.ntrip_bytes_received / (METRICS_INTERVAL / 1000.0);
+status.uart_data_rate = status.uart_bytes_sent / (METRICS_INTERVAL / 1000.0);
+status.ntrip_bytes_received = 0;
+status.uart_bytes_sent = 0;
+lastMetricsUpdate = millis();
+sendWebSocketStatus();
+}
+}
+
+
+
+
+
